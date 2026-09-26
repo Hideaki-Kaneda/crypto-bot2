@@ -83,19 +83,36 @@ public class AppProperties {
      */
     private BigDecimal size = new BigDecimal("0.01");
 
-    /** 損切りライン（%）*/
-    private double stopLossPercent = 3.0;
-
-    /** 利確ライン（%）*/
-    private double takeProfitPercent = 5.0;
-
     /** ポジション重複防止 */
     private boolean positionManagement = true;
 
     /**
+     * 損切りライン（円）。
+     * 含み損がこの金額を超えたら損切りする。負の値で指定。
+     * 例: -5000 → 含み損が -5,000円 以下になったら損切り
+     * 0 = 損切りなし。
+     */
+    private java.math.BigDecimal stopLossJpy = new java.math.BigDecimal("-5000");
+
+    /**
+     * 符号反転（売建て利確）の最低保有本数。
+     * 価格反転(-): TEMA_FAST がマイナス→プラスに反転した時（売建て利確）。
+     * 新規建てからこの本数未満の場合は符号反転による利確をスキップする。
+     * 0 = 制限なし。
+     */
+    private int flipCloseSellMinBars = 5;
+
+    /**
+     * 符号反転（買建て利確）の最低保有本数。
+     * 価格反転(+): TEMA_FAST がプラス→マイナスに反転した時（買建て利確）。
+     * 新規建てからこの本数未満の場合は符号反転による利確をスキップする。
+     * 0 = 制限なし。
+     */
+    private int flipCloseBuyMinBars = 4;
+
+    /**
      * レバレッジ取引の銘柄コードサフィックス。
      * GMOコインのレバレッジ銘柄は "BTC_JPY" 形式。
-     * 空文字にすると現物（"BTC"）扱いになる（通常は "_JPY" を設定する）。
      */
     private String leverageSymbolSuffix = "_JPY";
   }
@@ -127,7 +144,36 @@ public class AppProperties {
     private double dmiAdxThreshold = 25.0;
     /** ADX の平滑化期間（DI 期間とは独立して設定可能） */
     private int adxPeriod = 9;
+    /**
+     * 新規建て時の RCI フィルター範囲。
+     * RCI がこの範囲内（rciEntryMin ≤ RCI ≤ rciEntryMax）の場合は
+     * 横ばい相場とみなし新規建てを行わない。利確（決済）には影響しない。
+     */
+    private double rciEntryMin = -60.0;
+    private double rciEntryMax =  60.0;
 
+    /**
+     * トレンドフィルター用 EMA 期間。
+     * TEMA_FAST が EMA より上 → BUY のみ許可（SELL エントリー禁止）
+     * TEMA_FAST が EMA より下 → SELL のみ許可（BUY エントリー禁止）
+     * 0 = フィルターなし。
+     */
+    private int emaTrendPeriod = 20;
+
+    /**
+     * EMA トレンドフィルターの方向を反転する。
+     * true の場合:
+     *   TEMA_FAST > EMA → SELL のみ許可（逆張り）
+     *   TEMA_FAST < EMA → BUY のみ許可（逆張り）
+     */
+    private boolean emaTrendReverse = false;
+
+    /**
+     * 売買シグナルを反転する。
+     * true の場合: GC → SELL（空売り）/ DC → BUY（買い）
+     * 符号反転も逆転する: マイナス→プラス → SELL / プラス→マイナス → BUY
+     */
+    private boolean signalReverse = false;
     // RCI
     private int rciPeriod = 5;
     private double rciOversold = -80.0;

@@ -26,6 +26,8 @@ public class TradeHistory {
   private Long signalId;
   private String note;
 
+  private BigDecimal profitJpy;
+  
   public enum Side {
     BUY, SELL
   }

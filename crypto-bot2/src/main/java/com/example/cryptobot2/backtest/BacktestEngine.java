@@ -3,6 +3,7 @@ package com.example.cryptobot2.backtest;
 import com.example.cryptobot2.client.GmoCoinApiClient;
 import com.example.cryptobot2.config.AppProperties;
 import com.example.cryptobot2.indicator.DmiCalculator;
+import com.example.cryptobot2.indicator.EmaCalculator;
 import com.example.cryptobot2.indicator.MacdCalculator;
 import com.example.cryptobot2.indicator.RciCalculator;
 import com.example.cryptobot2.indicator.RsiCalculator;
@@ -50,7 +51,7 @@ import org.springframework.stereotype.Component;
 public class BacktestEngine {
 
   private static final MathContext MC = new MathContext(10, RoundingMode.HALF_UP);
-  private static final int CONSECUTIVE_REVERSE_COUNT = 3;
+  private static final int CONSECUTIVE_REVERSE_COUNT = 3; // 互換性のため残す（未使用）
   private static final DateTimeFormatter DATE_FMT = DateTimeFormatter.ofPattern("yyyyMMdd");
   private static final DateTimeFormatter YEAR_FMT = DateTimeFormatter.ofPattern("yyyy");
   private static final List<String> DAILY_OR_LONGER =
@@ -179,186 +180,254 @@ public class BacktestEngine {
 
     List<BacktestResult.Trade> trades = new ArrayList<>();
 
-    // 仮想ポジション管理
     BigDecimal balance     = initialBalance;
     BigDecimal peakBalance = initialBalance;
     BigDecimal maxDrawdown = BigDecimal.ZERO;
 
-    VirtualPosition position = null; // null=ポジションなし
-    List<Signal> recentSignals = new ArrayList<>(); // 連続シグナル管理（HOLD除く）
+    VirtualPosition position = null;
 
     for (int i = 0; i < klines.size(); i++) {
       KlineRecord current = klines.get(i);
       BigDecimal price    = current.getClose();
       OffsetDateTime time = current.getOpenTime();
 
-      // 指標計算用の直前データを取得（現在足を含まない）
       List<KlineRecord> history = getHistory(klines, i, historySize);
-      if (history.size() < 2) continue; // データ不足はスキップ
+      if (history.size() < 2) continue;
 
       List<BigDecimal> closes = history.stream().map(KlineRecord::getClose).toList();
       List<BigDecimal> highs  = history.stream().map(KlineRecord::getHigh).toList();
       List<BigDecimal> lows   = history.stream().map(KlineRecord::getLow).toList();
 
-      // 指標計算
+      // 各指標計算（DB記録用）
       BigDecimal rsiVal = RsiCalculator.calculate(closes, ind.getRsiPeriod());
       Signal rsiSignal  = toRsiSignal(rsiVal, ind);
-
       MacdCalculator.MacdResult macdResult = MacdCalculator.calculate(
           closes, ind.getMacdFastPeriod(), ind.getMacdSlowPeriod(), ind.getMacdSignalPeriod());
       CrossSignal macdCross = macdResult == null ? null
           : CrossSignal.valueOf(macdResult.getCross().name());
-
       DmiCalculator.DmiResult dmiResult = DmiCalculator.calculate(
           highs, lows, closes, ind.getDmiPeriod(), ind.getAdxPeriod());
       Signal dmiSignal = toDmiSignal(dmiResult, ind);
-
       BigDecimal rciVal = RciCalculator.calculate(closes, ind.getRciPeriod());
       Signal rciSignal  = toRciSignal(rciVal, ind);
-
       TemaCalculator.TemaResult temaResult = TemaCalculator.calculatePair(
           closes, ind.getTemaFastPeriod(), ind.getTemaSlowPeriod());
       CrossSignal temaCross = temaResult == null ? null
           : CrossSignal.valueOf(temaResult.getCross().name());
 
-      // 前回シグナル（直前の HOLD 以外）
-      Signal prevRciSig = null;
-      CrossSignal prevMacdCross = null;
-      if (!recentSignals.isEmpty()) {
-        // recentSignals には前回の値が入っている（後で追加）
-      }
-      // 直前足の RCI / MACD / TEMA を履歴から再計算
-      BigDecimal prevRci = null;
-      CrossSignal prevMacd = null;
-      CrossSignal prevTema = null;
+      // 前回・前々回 TEMA_FAST（利確の TEMA_FAST 変化反転判定用）
+      BigDecimal nowTemaFast     = temaResult == null ? null : temaResult.getTemaFast();
+      BigDecimal prevTemaFast    = null;
+      BigDecimal prevPrevTemaFast = null;
       if (i > 0) {
-        List<KlineRecord> prevHistory = getHistory(klines, i - 1, historySize);
-        if (!prevHistory.isEmpty()) {
-          List<BigDecimal> prevCloses = prevHistory.stream().map(KlineRecord::getClose).toList();
-          prevRci = RciCalculator.calculate(prevCloses, ind.getRciPeriod());
-          MacdCalculator.MacdResult pm = MacdCalculator.calculate(prevCloses,
-              ind.getMacdFastPeriod(), ind.getMacdSlowPeriod(), ind.getMacdSignalPeriod());
-          prevMacd = pm == null ? null : CrossSignal.valueOf(pm.getCross().name());
-          TemaCalculator.TemaResult pt = TemaCalculator.calculatePair(
-              prevCloses, ind.getTemaFastPeriod(), ind.getTemaSlowPeriod());
-          prevTema = pt == null ? null : CrossSignal.valueOf(pt.getCross().name());
+        List<KlineRecord> h1 = getHistory(klines, i - 1, historySize);
+        if (!h1.isEmpty()) {
+          List<BigDecimal> c1 = h1.stream().map(KlineRecord::getClose).toList();
+          TemaCalculator.TemaResult t1 = TemaCalculator.calculatePair(
+              c1, ind.getTemaFastPeriod(), ind.getTemaSlowPeriod());
+          prevTemaFast = t1 == null ? null : t1.getTemaFast();
+        }
+      }
+      if (i > 1) {
+        List<KlineRecord> h2 = getHistory(klines, i - 2, historySize);
+        if (!h2.isEmpty()) {
+          List<BigDecimal> c2 = h2.stream().map(KlineRecord::getClose).toList();
+          TemaCalculator.TemaResult t2 = TemaCalculator.calculatePair(
+              c2, ind.getTemaFastPeriod(), ind.getTemaSlowPeriod());
+          prevPrevTemaFast = t2 == null ? null : t2.getTemaFast();
         }
       }
 
-      // シグナル判定
-      Signal signal = calcSignal(rsiVal, rsiSignal, rciVal, rciSignal, dmiSignal,
-          macdCross, temaCross, prevRci, prevMacd, prevTema);
+      // EMA トレンドフィルター計算
+      int emaPeriod = ind.getEmaTrendPeriod();
+      BigDecimal emaVal = emaPeriod > 0
+          ? EmaCalculator.calculate(closes, emaPeriod) : null;
+      boolean emaAbove = emaVal != null && nowTemaFast != null
+          && nowTemaFast.compareTo(emaVal) > 0;
+      boolean emaBelow = emaVal != null && nowTemaFast != null
+          && nowTemaFast.compareTo(emaVal) < 0;
 
-      // 連続シグナルによるドテン判定
-      if (signal != Signal.HOLD) {
-        signal = applyConsecutiveReverse(recentSignals, signal);
-        recentSignals.add(signal);
-        if (recentSignals.size() > CONSECUTIVE_REVERSE_COUNT) {
-          recentSignals.remove(0);
-        }
+      boolean reverse = ind.isEmaTrendReverse();
+      boolean emaBullish, emaBearish;
+      if (emaVal == null || nowTemaFast == null) {
+        emaBullish = true;
+        emaBearish = true;
+      } else if (reverse) {
+        emaBullish = emaBelow;  // 逆張り: TEMA_FAST < EMA → BUY 許可
+        emaBearish = emaAbove;  // 逆張り: TEMA_FAST > EMA → SELL 許可
+      } else {
+        emaBullish = emaAbove;  // 順張り: TEMA_FAST > EMA → BUY 許可
+        emaBearish = emaBelow;  // 順張り: TEMA_FAST < EMA → SELL 許可
       }
 
-      // trade_signal に保存（バックテスト確認用）
-      AppProperties.Indicator ind2 = ind; // effectively final
+      // シグナル判定（TradingStrategy と同一ロジック）
+      Signal signal = calcSignal(temaCross, nowTemaFast, prevTemaFast, prevPrevTemaFast,
+          emaBullish, emaBearish);
+
+      // シグナル反転（逆張りモード）
+      if (ind.isSignalReverse() && signal != Signal.HOLD) {
+        signal = signal == Signal.BUY ? Signal.SELL : Signal.BUY;
+      }
+
+      // trade_signal 保存（バックテスト確認用）
       TradeSignal ts = TradeSignal.builder()
-          .symbol(symbol)
-          .signalTime(time)
-          .price(price)
-          .rsi(rsiVal)
-          .rsiPeriod(ind2.getRsiPeriod())
-          .rsiSignal(rsiSignal)
+          .symbol(symbol).signalTime(time).price(price)
+          .rsi(rsiVal).rsiPeriod(ind.getRsiPeriod()).rsiSignal(rsiSignal)
           .macd(macdResult == null ? null : macdResult.getMacd())
           .macdSignal(macdResult == null ? null : macdResult.getSignal())
           .macdHistogram(macdResult == null ? null : macdResult.getHistogram())
-          .macdFast(ind2.getMacdFastPeriod())
-          .macdSlow(ind2.getMacdSlowPeriod())
-          .macdSignalPeriod(ind2.getMacdSignalPeriod())
-          .macdCross(macdCross)
+          .macdFast(ind.getMacdFastPeriod()).macdSlow(ind.getMacdSlowPeriod())
+          .macdSignalPeriod(ind.getMacdSignalPeriod()).macdCross(macdCross)
           .dmiPlus(dmiResult == null ? null : dmiResult.getPlusDi())
           .dmiMinus(dmiResult == null ? null : dmiResult.getMinusDi())
           .adx(dmiResult == null ? null : dmiResult.getAdx())
-          .dmiPeriod(ind2.getDmiPeriod())
-          .dmiSignal(dmiSignal)
-          .rci(rciVal)
-          .rciPeriod(ind2.getRciPeriod())
-          .rciSignal(rciSignal)
+          .dmiPeriod(ind.getDmiPeriod()).dmiSignal(dmiSignal)
+          .rci(rciVal).rciPeriod(ind.getRciPeriod()).rciSignal(rciSignal)
           .temaFast(temaResult == null ? null : temaResult.getTemaFast())
-          .temaFastPeriod(ind2.getTemaFastPeriod())
+          .temaFastPeriod(ind.getTemaFastPeriod())
           .temaSlow(temaResult == null ? null : temaResult.getTemaSlow())
-          .temaSlowPeriod(ind2.getTemaSlowPeriod())
-          .temaCross(temaCross)
+          .temaSlowPeriod(ind.getTemaSlowPeriod()).temaCross(temaCross)
           .finalSignal(signal)
           .build();
       signalRepository.save(ts);
 
-      // 損切り・利確チェック（最優先）
-      if (position != null) {
-        double changePercent = calcChangePercent(position.openPrice(), price, position.side());
-        boolean stopped = false;
-
-        if (changePercent <= -Math.abs(trade.getStopLossPercent())) {
-          BigDecimal profit = calcProfit(position, price);
-          balance = balance.add(profit);
-          trades.add(buildTrade(symbol, time, closeSide(position.side()),
-              price, trade.getSize(), profit, balance, CloseReason.STOP_LOSS, "損切り"));
-          log.debug("[BT] 損切り: time={} side={} openPrice={} closePrice={} profit={}",
-              time, position.side(), position.openPrice(), price, profit);
-          position = null;
-          stopped = true;
-        } else if (changePercent >= trade.getTakeProfitPercent()) {
-          BigDecimal profit = calcProfit(position, price);
-          balance = balance.add(profit);
-          trades.add(buildTrade(symbol, time, closeSide(position.side()),
-              price, trade.getSize(), profit, balance, CloseReason.TAKE_PROFIT, "利確"));
-          log.debug("[BT] 利確: time={} side={} openPrice={} closePrice={} profit={}",
-              time, position.side(), position.openPrice(), price, profit);
-          position = null;
-          stopped = true;
-        }
-
+      if (signal == Signal.HOLD) {
         // ドローダウン更新
         if (balance.compareTo(peakBalance) > 0) peakBalance = balance;
         BigDecimal drawdown = peakBalance.subtract(balance);
         if (drawdown.compareTo(maxDrawdown) > 0) maxDrawdown = drawdown;
-
-        if (stopped) continue;
+        continue;
       }
 
-      // シグナルによる売買実行
-      if (signal == Signal.HOLD) continue;
-
       if (position == null) {
-        // 新規建て（BUY or SELL）
-        position = new VirtualPosition(signal == Signal.BUY ? Side.BUY : Side.SELL,
-            price, time, trade.getSize());
-        trades.add(buildTrade(symbol, time,
-            signal == Signal.BUY ? Side.BUY : Side.SELL,
-            price, trade.getSize(), null, balance, null,
-            "新規" + (signal == Signal.BUY ? "買" : "売")));
-        log.debug("[BT] 新規{}: time={} price={}", signal, time, price);
+        // ポジションなし: クロスがあれば新規建て（符号反転のみでは新規なし）
+        boolean isGolden = temaCross == CrossSignal.GOLDEN;
+        boolean isDead   = temaCross == CrossSignal.DEAD;
+        if (isGolden || isDead) {
+          // RCI フィルター: RCI が [rciEntryMin, rciEntryMax] 範囲内は新規建てしない
+          double rciEntryMin = ind.getRciEntryMin();
+          double rciEntryMax = ind.getRciEntryMax();
+          boolean rciBlocked = rciVal != null
+              && rciVal.doubleValue() >= rciEntryMin
+              && rciVal.doubleValue() <= rciEntryMax;
+
+          if (rciBlocked) {
+            log.debug("[BT] 新規建てスキップ（RCI={} は範囲[{},{}]内）: time={} cross={}",
+                rciVal, rciEntryMin, rciEntryMax, time, temaCross);
+          } else {
+            boolean flipped = (isGolden && signal == Signal.SELL)
+                           || (isDead   && signal == Signal.BUY);
+            Side newSide;
+            String label;
+            if (flipped) {
+              newSide = signal == Signal.BUY ? Side.BUY : Side.SELL;
+              label   = newSide == Side.BUY ? "新規買(GC+反転)" : "新規売(DC+反転)";
+            } else {
+              newSide = isGolden ? Side.BUY : Side.SELL;
+              label   = newSide == Side.BUY ? "新規買(GC)" : "新規売(DC)";
+            }
+            position = new VirtualPosition(newSide, price, time, trade.getSize());
+            trades.add(buildTrade(symbol, time, newSide,
+                price, trade.getSize(), null, balance, null, label));
+            log.debug("[BT] {}: time={} price={}", label, time, price);
+          }
+        }
+        // 符号反転のみのシグナルはポジションなしでは無視
 
       } else {
-        // ドテン: 既存ポジションを決済 → 逆方向で新規建て
-        boolean isReverse =
-            (position.side() == Side.BUY  && signal == Signal.SELL) ||
-            (position.side() == Side.SELL && signal == Signal.BUY);
+        // ポジションあり
+        boolean isGolden = temaCross == CrossSignal.GOLDEN;
+        boolean isDead   = temaCross == CrossSignal.DEAD;
+        boolean isCross  = isGolden || isDead;
 
-        if (isReverse) {
-          BigDecimal profit = calcProfit(position, price);
-          balance = balance.add(profit);
-          trades.add(buildTrade(symbol, time, closeSide(position.side()),
-              price, trade.getSize(), profit, balance, CloseReason.SIGNAL, "ドテン決済"));
-          log.debug("[BT] ドテン決済: time={} side={} profit={}", time, position.side(), profit);
+        // 損切りチェック（最優先）
+        java.math.BigDecimal stopLossJpy = trade.getStopLossJpy();
+        if (stopLossJpy != null && stopLossJpy.compareTo(BigDecimal.ZERO) != 0) {
+          BigDecimal unrealizedPnl;
+          if (position.side() == Side.BUY) {
+            unrealizedPnl = price.subtract(position.openPrice())
+                .multiply(position.size(), MC).setScale(0, RoundingMode.HALF_UP);
+          } else {
+            unrealizedPnl = position.openPrice().subtract(price)
+                .multiply(position.size(), MC).setScale(0, RoundingMode.HALF_UP);
+          }
+          if (unrealizedPnl.compareTo(stopLossJpy) <= 0) {
+            BigDecimal profit = calcProfit(position, price);
+            balance = balance.add(profit);
+            trades.add(buildTrade(symbol, time, closeSide(position.side()),
+                price, trade.getSize(), profit, balance, CloseReason.STOP_LOSS, "損切り"));
+            log.debug("[BT] 損切り: time={} side={} unrealizedPnl={}", time, position.side(), unrealizedPnl);
+            position = null;
 
-          // 新規建て
-          position = new VirtualPosition(signal == Signal.BUY ? Side.BUY : Side.SELL,
-              price, time, trade.getSize());
-          trades.add(buildTrade(symbol, time,
-              signal == Signal.BUY ? Side.BUY : Side.SELL,
-              price, trade.getSize(), null, balance, null,
-              "ドテン新規" + (signal == Signal.BUY ? "買" : "売")));
+            // ドローダウン更新
+            if (balance.compareTo(peakBalance) > 0) peakBalance = balance;
+            BigDecimal drawdown = peakBalance.subtract(balance);
+            if (drawdown.compareTo(maxDrawdown) > 0) maxDrawdown = drawdown;
+            continue;
+          }
         }
-        // 同方向はスキップ
+
+        // 利確判定: クロス方向を優先、クロスなしは finalSignal（符号反転）で判定
+        Signal crossSignal = isGolden ? Signal.BUY : isDead ? Signal.SELL : null;
+        Signal judgeSignal = crossSignal != null ? crossSignal : signal;
+
+        boolean shouldClose =
+            (position.side() == Side.BUY  && judgeSignal == Signal.SELL) ||
+            (position.side() == Side.SELL && judgeSignal == Signal.BUY);
+
+        if (shouldClose) {
+          String reason;
+          if (position.side() == Side.BUY) {
+            reason = isDead ? "TEMA_DEAD" : "価格反転(+)";
+          } else {
+            reason = isGolden ? "TEMA_GOLDEN" : "価格反転(-)";
+          }
+
+          // 符号反転による利確の場合、最低保有本数チェック
+          boolean flipBlocked = !isCross && isFlipCloseBlocked(
+              position.openTime(), time, reason, trade, ind);
+
+          if (flipBlocked) {
+            log.debug("[BT] 符号反転利確スキップ（保有本数不足）: time={} reason={}", time, reason);
+          } else {
+            // 利確決済
+            BigDecimal profit = calcProfit(position, price);
+            balance = balance.add(profit);
+            trades.add(buildTrade(symbol, time, closeSide(position.side()),
+                price, trade.getSize(), profit, balance, CloseReason.SIGNAL, reason));
+            log.debug("[BT] 利確: time={} side={} profit={} reason={} temaCross={}",
+                time, position.side(), profit, reason, temaCross);
+            position = null;
+
+            // クロスがある場合は利確直後に逆方向で新規建て
+            if (isCross) {
+              boolean rciBlocked2 = rciVal != null
+                  && rciVal.doubleValue() >= ind.getRciEntryMin()
+                  && rciVal.doubleValue() <= ind.getRciEntryMax();
+
+              // EMA トレンドフィルター（利確後新規建てにも適用）
+              Side newSide = isGolden ? Side.BUY : Side.SELL;
+              boolean emaBlockedNew = (newSide == Side.BUY && !emaBullish)
+                  || (newSide == Side.SELL && !emaBearish);
+
+              if (rciBlocked2) {
+                log.debug("[BT] 利確後新規建てスキップ（RCI={} は範囲[{},{}]内）: time={} cross={}",
+                    rciVal, ind.getRciEntryMin(), ind.getRciEntryMax(), time, temaCross);
+              } else if (emaBlockedNew) {
+                log.debug("[BT] 利確後新規建てスキップ（EMAトレンド逆行）: time={} side={} emaBullish={} emaBearish={}",
+                    time, newSide, emaBullish, emaBearish);
+              } else {
+                position = new VirtualPosition(newSide, price, time, trade.getSize());
+                trades.add(buildTrade(symbol, time, newSide,
+                    price, trade.getSize(), null, balance, null,
+                    "利確後即新規" + (newSide == Side.BUY ? "買(GC)" : "売(DC)")));
+                log.debug("[BT] 利確後即新規{}: time={} price={}", newSide, time, price);
+              }
+            }
+            // 符号反転のみの場合は利確のみ（新規なし）
+          }
+        }
+        // スキップ（同方向）
       }
 
       // ドローダウン更新
@@ -383,66 +452,39 @@ public class BacktestEngine {
   // 売買シグナル判定（TradingStrategy と同一ロジック）
   // -----------------------------------------------------------------------
 
-  private Signal calcSignal(BigDecimal rsi, Signal rsiSignal,
-      BigDecimal rci, Signal rciSignal, Signal dmiSignal,
-      CrossSignal macdCross, CrossSignal temaCross,
-      BigDecimal prevRci, CrossSignal prevMacd, CrossSignal prevTema) {
+  /**
+   * GC=BUY / DC=SELL、また TEMA_FAST の変化方向反転も利確条件として判定する。
+   *
+   * @param temaCross      今回の TEMA クロス
+   * @param nowTemaFast    今回の TEMA_FAST 値
+   * @param prevTemaFast   前回の TEMA_FAST 値
+   * @param prevPrevTemaFast 前々回の TEMA_FAST 値
+   */
+  private Signal calcSignal(CrossSignal temaCross,
+      BigDecimal nowTemaFast, BigDecimal prevTemaFast, BigDecimal prevPrevTemaFast,
+      boolean emaBullish, boolean emaBearish) {
 
-    double rciD = rci == null ? 0.0 : rci.doubleValue();
-    double rsiD = rsi == null ? 0.0 : rsi.doubleValue();
-    double pRci = prevRci == null ? 0.0 : prevRci.doubleValue();
+    boolean temaGolden = temaCross == CrossSignal.GOLDEN;
+    boolean temaDead   = temaCross == CrossSignal.DEAD;
 
-    boolean macdGolden     = macdCross == CrossSignal.GOLDEN;
-    boolean macdDead       = macdCross == CrossSignal.DEAD;
-    boolean temaGolden     = temaCross == CrossSignal.GOLDEN;
-    boolean temaDead       = temaCross == CrossSignal.DEAD;
-    boolean prevMacdGolden = prevMacd == CrossSignal.GOLDEN;
-    boolean prevMacdDead   = prevMacd == CrossSignal.DEAD;
-    boolean prevTemaGolden = prevTema == CrossSignal.GOLDEN;
-    boolean prevTemaDead   = prevTema == CrossSignal.DEAD;
-
-    AppProperties.Indicator ind = props.getIndicator();
-
-    // 売りシグナル（OR）
-    if ((rciD >= 90   && pRci <= 60  && !prevMacdGolden) ||           // ①
-        (rciD >= 100  && pRci <= 70  && !prevMacdGolden) ||           // ②
-        (rsiD > ind.getRsiOverbought() && macdGolden) ||              // ③
-        (macdGolden   && temaGolden  && rsiSignal == Signal.SELL) ||  // ④
-        (macdGolden   && prevTemaGolden) ||                           // ⑤
-        (temaGolden   && prevMacdGolden) ||                           // ⑥
-        (rciSignal == Signal.SELL && temaGolden) ||                   // ⑦
-        (dmiSignal == Signal.SELL && rciSignal == Signal.SELL && rsiD >= 65.0) || // ⑨
-        (macdGolden   && temaGolden  && dmiSignal == Signal.SELL)) {  // ⑩
-      return Signal.SELL;
+    // TEMA_FAST の変化方向の反転判定
+    boolean temaFlipToPlus  = false;
+    boolean temaFlipToMinus = false;
+    if (nowTemaFast != null && prevTemaFast != null && prevPrevTemaFast != null) {
+      int diff1Sign = prevTemaFast.compareTo(prevPrevTemaFast);
+      int diff2Sign = nowTemaFast.compareTo(prevTemaFast);
+      temaFlipToPlus  = diff1Sign < 0 && diff2Sign > 0; // マイナス→プラス → BUY
+      temaFlipToMinus = diff1Sign > 0 && diff2Sign < 0; // プラス→マイナス → SELL
     }
 
-    // 買いシグナル（OR）
-    if ((rciD <= -90  && pRci >= -60 && !prevMacdDead) ||            // ①
-        (rciD <= -100 && pRci >= -70 && !prevMacdDead) ||            // ②
-        (rsiD < ind.getRsiOversold() && macdDead) ||                  // ③
-        (macdDead     && temaDead    && rsiSignal == Signal.BUY) ||   // ④
-        (macdDead     && prevTemaDead) ||                             // ⑤
-        (temaDead     && prevMacdDead) ||                             // ⑥
-        (rciSignal == Signal.BUY && temaDead) ||                      // ⑦
-        (dmiSignal == Signal.BUY && rciSignal == Signal.BUY && rsiD <= 35.0) || // ⑨
-        (macdDead     && temaDead    && dmiSignal == Signal.BUY)) {   // ⑩
-      return Signal.BUY;
-    }
+    // 符号反転を優先（利確なので EMA フィルターなし）
+    if (temaFlipToPlus)  return Signal.BUY;
+    if (temaFlipToMinus) return Signal.SELL;
 
+    // クロスシグナル: EMA トレンドフィルターを適用（新規エントリー方向を制限）
+    if (temaGolden) return emaBullish ? Signal.BUY  : Signal.HOLD;
+    if (temaDead)   return emaBearish ? Signal.SELL : Signal.HOLD;
     return Signal.HOLD;
-  }
-
-  private Signal applyConsecutiveReverse(List<Signal> recent, Signal current) {
-    if (recent.size() < CONSECUTIVE_REVERSE_COUNT - 1) return current;
-    List<Signal> lastN = recent.subList(
-        recent.size() - (CONSECUTIVE_REVERSE_COUNT - 1), recent.size());
-    boolean allSame = lastN.stream().allMatch(s -> s == current);
-    if (allSame) {
-      Signal reversed = current == Signal.BUY ? Signal.SELL : Signal.BUY;
-      log.debug("[BT] 連続{}回ドテン: {} → {}", CONSECUTIVE_REVERSE_COUNT, current, reversed);
-      return reversed;
-    }
-    return current;
   }
 
   // -----------------------------------------------------------------------
@@ -475,18 +517,44 @@ public class BacktestEngine {
   // ヘルパー
   // -----------------------------------------------------------------------
 
+  private boolean isFlipCloseBlocked(
+      java.time.OffsetDateTime openTime, java.time.OffsetDateTime signalTime,
+      String reason, AppProperties.Trade trade, AppProperties.Indicator ind) {
+
+    int minBars;
+    if ("価格反転(-)".equals(reason)) {
+      minBars = trade.getFlipCloseSellMinBars();
+    } else if ("価格反転(+)".equals(reason)) {
+      minBars = trade.getFlipCloseBuyMinBars();
+    } else {
+      return false;
+    }
+
+    if (minBars <= 0) return false;
+
+    long intervalMinutes = switch (props.getKline().getInterval()) {
+      case "1min"   ->    1L;
+      case "5min"   ->    5L;
+      case "10min"  ->   10L;
+      case "15min"  ->   15L;
+      case "30min"  ->   30L;
+      case "1hour"  ->   60L;
+      case "4hour"  ->  240L;
+      case "8hour"  ->  480L;
+      case "12hour" ->  720L;
+      case "1day"   -> 1440L;
+      default       ->   10L;
+    };
+
+    long elapsedMinutes = java.time.Duration.between(openTime, signalTime).toMinutes();
+    long holdBars = elapsedMinutes / intervalMinutes;
+    return holdBars < minBars;
+  }
+
   /** klines[0..i-1] の末尾 limit 件を返す（現在足は含まない） */
   private List<KlineRecord> getHistory(List<KlineRecord> klines, int i, int limit) {
     int from = Math.max(0, i - limit);
     return klines.subList(from, i);
-  }
-
-  private double calcChangePercent(BigDecimal openPrice, BigDecimal currentPrice, Side side) {
-    double change = currentPrice.subtract(openPrice)
-        .divide(openPrice, MC)
-        .multiply(BigDecimal.valueOf(100))
-        .doubleValue();
-    return side == Side.SELL ? -change : change;
   }
 
   private BigDecimal calcProfit(VirtualPosition pos, BigDecimal closePrice) {

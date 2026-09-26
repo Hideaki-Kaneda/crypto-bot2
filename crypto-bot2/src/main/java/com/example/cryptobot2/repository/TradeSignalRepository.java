@@ -3,6 +3,7 @@ package com.example.cryptobot2.repository;
 import com.example.cryptobot2.model.TradeSignal;
 import com.example.cryptobot2.model.TradeSignal.CrossSignal;
 import com.example.cryptobot2.model.TradeSignal.Signal;
+import java.math.BigDecimal;
 import java.util.List;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -61,7 +62,7 @@ public class TradeSignalRepository {
       """;
 
   private static final String SELECT_PREV_SIGNAL_SQL = """
-      SELECT rci, macd_cross, tema_cross, final_signal
+      SELECT rci, macd_cross, tema_cross, tema_fast, final_signal
       FROM trade_signal
       WHERE symbol = ? AND signal_time < ?
       ORDER BY signal_time DESC
@@ -91,6 +92,7 @@ public class TradeSignalRepository {
         toBigDecimal(row.get("rci")),
         toStr(row.get("macd_cross")),
         toStr(row.get("tema_cross")),
+        toBigDecimal(row.get("tema_fast")),
         toStr(row.get("final_signal"))
     );
   }
@@ -116,6 +118,7 @@ public class TradeSignalRepository {
       java.math.BigDecimal rci,
       String macdCross,
       String temaCross,
+      java.math.BigDecimal temaFast,
       String finalSignal
   ) {
     public boolean isMacdGolden() { return "GOLDEN".equals(macdCross); }
@@ -207,6 +210,41 @@ public class TradeSignalRepository {
   // -----------------------------------------------------------------------
   // helpers
   // -----------------------------------------------------------------------
+
+  /**
+   * 指定シグナル時刻より前の直近終値を2件取得する（新しい順）。
+   * インデックス0が直前、インデックス1が前々回。
+   * 利確判定の「価格変化方向の反転」チェックに使用する。
+   */
+  public List<BigDecimal> fetchPrevCloses(String symbol, String interval,
+      java.time.OffsetDateTime before) {
+    List<java.util.Map<String, Object>> rows = jdbcTemplate.queryForList("""
+        SELECT close FROM kline_data
+        WHERE symbol = ? AND interval_type = ? AND open_time < ?
+        ORDER BY open_time DESC
+        LIMIT 2
+        """, symbol, interval, before);
+    return rows.stream()
+        .map(r -> toBigDecimal(r.get("close")))
+        .toList();
+  }
+
+  /**
+   * 指定シグナル時刻より前の直近 TEMA_FAST 値を n 件取得する（新しい順）。
+   * 利確判定の「TEMA_FAST 変化方向の反転」チェックに使用する。
+   *
+   * @return Map のリスト。各要素に "tema_fast" キーで BigDecimal 値を持つ
+   */
+  public List<java.util.Map<String, Object>> fetchPrevTemaFast(
+      String symbol, String interval, java.time.OffsetDateTime before, int limit) {
+    // trade_signal の signal_time で近似取得（kline の open_time と対応）
+    return jdbcTemplate.queryForList("""
+        SELECT tema_fast FROM trade_signal
+        WHERE symbol = ? AND signal_time < ?
+        ORDER BY signal_time DESC
+        LIMIT ?
+        """, symbol, before, limit);
+  }
 
   private String toStr(Signal s) {
     return s == null ? null : s.name();

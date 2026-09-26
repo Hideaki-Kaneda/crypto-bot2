@@ -7,11 +7,12 @@
 
 ## プロジェクト概要
 
-GMOコインのレバレッジ取引（信用取引）を自動化する Java バッチアプリケーション。
+GMOコインの BTC_JPY レバレッジ取引を自動化する Java バッチアプリケーション。
 
 - KLine（ローソク足）データを定期取得して PostgreSQL に保存
-- RSI・MACD・DMI・RCI・TEMA の5指標を用いた売買シグナル判定
-- 新規買建て・新規売建て（空売り）・ドテン売買に対応
+- TEMA(5/9) クロスを主軸とした売買シグナル判定
+- **signal-reverse=true**: GC→売建て（空売り）/ DC→買建て の逆張り戦略
+- EMA20 トレンドフィルターでエントリー方向を制限
 - ペーパートレード（模擬売買）と本番売買を切り替え可能
 - バックテスト機能（kline_data を使った過去データシミュレーション）
 
@@ -38,129 +39,174 @@ crypto-bot2/
 ├── pom.xml
 ├── CLAUDE.md
 ├── scripts/
-│   └── encrypt-secrets.bat           # API KEY/SECRET 暗号化ユーティリティ（Windows）
+│   └── encrypt-secrets.bat
 └── src/main/
     ├── java/com/example/cryptobot2/
-    │   ├── CryptoBot2Application.java  # エントリポイント（--backtest オプション対応）
+    │   ├── CryptoBot2Application.java      # エントリポイント（--backtest オプション対応）
     │   ├── backtest/
-    │   │   └── BacktestEngine.java     # バックテストエンジン
+    │   │   └── BacktestEngine.java         # バックテストエンジン
     │   ├── client/
-    │   │   ├── GmoCoinApiClient.java   # Public API（KLine取得）
-    │   │   └── GmoCoinPrivateApiClient.java  # Private API（注文・残高）
+    │   │   ├── GmoCoinApiClient.java        # Public API（KLine取得）
+    │   │   └── GmoCoinPrivateApiClient.java # Private API（注文・残高）
     │   ├── config/
-    │   │   ├── AppConfig.java          # Bean定義・起動時復号（@PostConstruct）
-    │   │   └── AppProperties.java      # @ConfigurationProperties（gmo.*）
-    │   ├── exception/
-    │   │   └── CryptoBotException.java # アプリ共通例外
+    │   │   ├── AppConfig.java               # Bean定義・起動時復号
+    │   │   └── AppProperties.java           # @ConfigurationProperties（gmo.*）
     │   ├── indicator/
+    │   │   ├── EmaCalculator.java           # EMA 計算
     │   │   ├── RsiCalculator.java
     │   │   ├── MacdCalculator.java
-    │   │   ├── DmiCalculator.java      # calculate(highs, lows, closes, period, adxPeriod)
+    │   │   ├── DmiCalculator.java           # calculate(highs, lows, closes, period, adxPeriod)
     │   │   ├── RciCalculator.java
-    │   │   └── TemaCalculator.java     # calculatePair(closes, fastPeriod, slowPeriod)
+    │   │   └── TemaCalculator.java          # calculatePair(closes, fastPeriod, slowPeriod)
     │   ├── model/
-    │   │   ├── KlineData.java          # API レスポンス JSON モデル
-    │   │   ├── KlineRecord.java        # kline_data エンティティ
-    │   │   ├── TradeSignal.java        # trade_signal エンティティ（Signal・CrossSignal enum 含む）
-    │   │   ├── TradeHistory.java       # trade_history エンティティ
-    │   │   ├── Position.java           # position エンティティ
-    │   │   └── BacktestResult.java     # バックテスト結果モデル
+    │   │   ├── KlineData.java
+    │   │   ├── KlineRecord.java
+    │   │   ├── TradeSignal.java             # Signal・CrossSignal enum / emaBullish・emaBearish フィールド含む
+    │   │   ├── TradeHistory.java            # profitJpy フィールド含む
+    │   │   ├── Position.java
+    │   │   └── BacktestResult.java
     │   ├── repository/
-    │   │   ├── KlineRepository.java        # kline_data UPSERT
-    │   │   ├── TradeSignalRepository.java  # trade_signal 保存・前回シグナル取得
-    │   │   ├── TradeRepository.java        # trade_history / position CRUD
-    │   │   ├── BacktestRepository.java     # バックテスト用 kline_data 取得
-    │   │   └── BacktestResultRepository.java # バックテスト結果保存
+    │   │   ├── KlineRepository.java
+    │   │   ├── TradeSignalRepository.java   # fetchPrevTemaFast・fetchPrevSignal・isConsecutiveSignal
+    │   │   ├── TradeRepository.java         # trade_history に profit_jpy 保存対応済み
+    │   │   ├── BacktestRepository.java      # existsByGmoDate（JST 06:00 基準）
+    │   │   └── BacktestResultRepository.java
     │   ├── scheduler/
-    │   │   ├── KlineScheduler.java     # KLine 定期取得（gmo.scheduler.cron）
-    │   │   └── TradeScheduler.java     # 自動売買定期実行（gmo.scheduler.trade-cron）
+    │   │   ├── KlineScheduler.java          # KLine 定期取得
+    │   │   └── TradeScheduler.java          # 自動売買定期実行
     │   ├── service/
-    │   │   ├── KlineService.java       # KLine 取得・保存ロジック
-    │   │   └── EncryptionService.java  # AES-256-GCM 暗号化/復号
+    │   │   ├── KlineService.java            # JST 06:05 基準の日付切替
+    │   │   └── EncryptionService.java
     │   ├── strategy/
-    │   │   └── TradingStrategy.java    # 売買シグナル判定・trade_signal 保存
+    │   │   └── TradingStrategy.java         # TEMA クロス + EMA フィルター + signal-reverse
     │   ├── trade/
-    │   │   ├── PaperTradeExecutor.java # ペーパートレード実行
-    │   │   └── TradeExecutor.java      # 本番レバレッジ売買実行
+    │   │   ├── PaperTradeExecutor.java      # ペーパートレード実行
+    │   │   └── TradeExecutor.java           # 本番レバレッジ売買実行
     │   └── util/
-    │       ├── EncryptCli.java         # 暗号化 CLI（PropertiesLauncher 経由）
-    │       └── ScheduleGuard.java      # メンテナンス時間・日付切替判定
+    │       ├── EncryptCli.java
+    │       └── ScheduleGuard.java           # メンテナンス時間・日付切替判定
     └── resources/
-        ├── application.properties      # メイン設定（Git 管理 OK）
-        ├── secret.properties           # 暗号化済み API KEY/SECRET（Git 除外）
-        ├── schema.sql                  # DB スキーマ（初回起動時自動実行）
-        └── logback-spring.xml          # ログ設定
+        ├── application.properties
+        ├── secret.properties                # 暗号化済み API KEY/SECRET（Git 除外）
+        ├── schema.sql
+        └── logback-spring.xml
 ```
 
 ---
 
-## 設定ファイル仕様
-
-### `application.properties`
+## 決定済み設定（application.properties）
 
 ```properties
-# GMOコイン Public API
-gmo.api.base-url=https://api.coin.z.com/public
-
-# KLine 取得設定（レバレッジ銘柄は _JPY 形式）
+# 銘柄・足種
 gmo.kline.symbols=BTC_JPY
-gmo.kline.interval=1hour        # 1min/5min/10min/15min/30min/1hour/4hour/8hour/12hour/1day/1week/1month
+gmo.kline.interval=10min
 
-# スケジューラ
-gmo.scheduler.cron=0 0 * * * *          # KLine 取得（毎時0分）
-gmo.scheduler.trade-cron=0 */10 * * * * # 自動売買（10分ごと）
+# スケジューラ（10分ごとに売買判定）
+gmo.scheduler.trade-cron=0 */10 * * * *
 gmo.scheduler.timezone=Asia/Tokyo
 
-# API リトライ・タイムアウト
-gmo.api.retry.max-attempts=3
-gmo.api.retry.delay-ms=1000
-gmo.api.timeout.connect-ms=5000
-gmo.api.timeout.read-ms=10000
+# 自動売買
+gmo.trade.paper-mode=true        # 本番移行時は false に変更
+gmo.trade.size=0.1               # 発注数量（BTC）
+gmo.trade.stop-loss-jpy=0        # 損切りなし
+gmo.trade.flip-close-sell-min-bars=0
+gmo.trade.flip-close-buy-min-bars=0
+gmo.trade.leverage-symbol-suffix=_JPY
 
-# 自動売買（レバレッジ取引）
-gmo.trade.paper-mode=true          # true=ペーパー / false=本番
-gmo.trade.size=0.01                # 発注数量（BTC 単位）
-gmo.trade.stop-loss-percent=3.0    # 損切り（建値から -3% で発動）
-gmo.trade.take-profit-percent=5.0  # 利確（建値から +5% で発動）
-gmo.trade.position-management=true # ポジション重複防止
-gmo.trade.leverage-symbol-suffix=_JPY  # BTC → BTC_JPY に変換
+# TEMA（売買の主軸指標）
+gmo.indicator.tema-fast-period=5
+gmo.indicator.tema-slow-period=9
 
-# 指標パラメータ
-gmo.indicator.rsi-period=14
-gmo.indicator.rsi-oversold=20.0
-gmo.indicator.rsi-overbought=80.0
-gmo.indicator.macd-fast-period=12
-gmo.indicator.macd-slow-period=26
-gmo.indicator.macd-signal-period=9
-gmo.indicator.dmi-period=14        # +DI/-DI の平滑化期間
-gmo.indicator.adx-period=9         # ADX の平滑化期間（DI とは独立）
-gmo.indicator.dmi-adx-threshold=25.0
-gmo.indicator.rci-period=5
-gmo.indicator.rci-oversold=-80.0
-gmo.indicator.rci-overbought=80.0
-gmo.indicator.tema-fast-period=12
-gmo.indicator.tema-slow-period=26
-gmo.indicator.tema-divergence-threshold-percent=0.1
-gmo.indicator.price-history-size=100
+# EMA トレンドフィルター
+gmo.indicator.ema-trend-period=20    # TEMA_FAST と EMA の位置関係でエントリー制限
+gmo.indicator.ema-trend-reverse=false # false=順張りフィルター
 
-# バックテスト（日付は起動引数で指定）
+# シグナル反転（逆張り戦略）
+gmo.indicator.signal-reverse=true    # GC→売建て / DC→買建て
+
+# RCI 新規建てフィルター
+gmo.indicator.rci-entry-min=-60.0
+gmo.indicator.rci-entry-max=60.0
+
+# バックテスト初期残高
 gmo.backtest.initial-balance-jpy=1000000
 ```
 
-### `secret.properties`（Git 除外）
+---
 
-```properties
-gmo.api.key=ENC(...)      # 暗号化済み API KEY
-gmo.api.secret=ENC(...)   # 暗号化済み API SECRET
+## 売買ロジック（TradingStrategy）
+
+### シグナル判定フロー
+
+```
+1. TEMA(5/9) のクロスを計算
+2. EMA20 フィルター適用
+   - TEMA_FAST > EMA20 → emaBullish=true（BUY エントリー許可）
+   - TEMA_FAST < EMA20 → emaBearish=true（SELL エントリー許可）
+3. signal-reverse=true により BUY/SELL を反転
+   - GC → SELL（空売り新規）
+   - DC → BUY（買建て新規）
+4. TEMA_FAST の符号反転（前々回→前回→今回の変化方向）で利確シグナル
+   - マイナス→プラス反転 → BUY
+   - プラス→マイナス反転 → SELL
+   ※ 符号反転は signal-reverse 適用後なので利確方向も逆転済み
 ```
 
-- `ENC(...)` は `EncryptionService` が起動時に自動復号
-- マスターパスワードは環境変数 `CRYPTO_MASTER_KEY` で渡す
-- 暗号化コマンド:
-  ```cmd
-  set CRYPTO_MASTER_KEY=your_password
-  scripts\encrypt-secrets.bat YOUR_API_KEY YOUR_API_SECRET
-  ```
+### Executor 動作（PaperTradeExecutor / TradeExecutor）
+
+```
+【ポジションなし + クロスあり】
+  EMA フィルター確認
+  RCI フィルター確認（-60〜60 範囲内はスキップ）
+  符号反転があればクロス方向を逆転して新規建て
+  → GC + 符号反転なし → 売建て新規
+  → GC + 符号反転(+→-)  → 買建て新規（逆転）
+
+【ポジションあり + 逆方向シグナル】
+  クロスが来た場合: 利確 → 即逆方向新規建て
+    ただし EMA フィルター・RCI フィルターを確認
+  符号反転のみ: 利確のみ（新規なし）
+
+【損切り】
+  なし（stop-loss-jpy=0）
+```
+
+### TEMA クロス判定
+
+```
+乖離率 = (FAST - SLOW) / |FAST| × 100
++divergence-threshold% 以上 → GOLDEN クロス
+-divergence-threshold% 以下 → DEAD クロス
+```
+
+---
+
+## バックテスト結果（決定設定）
+
+| 設定 | 合計損益 |
+|------|---------|
+| EMAなし + signal-reverse=true | +466,369円 |
+| EMA20 + signal-reverse=true | **+762,295円** ← 採用 |
+| EMA23 + signal-reverse=false | +267,800円 |
+
+**月別詳細（EMA20 + signal-reverse=true / BTC_JPY / 0.1BTC / 10分足）**
+
+| 月 | 勝 | 負 | 損益 | 最大損失 |
+|----|----|----|------|---------|
+| 2026-01 | 243 | 223 | +244,241円 | -17,628円 |
+| 2026-02 | 207 | 195 |  +45,544円 | -38,638円 |
+| 2026-03 | 220 | 207 |  +17,519円 | -24,024円 |
+| 2026-04 | 233 | 191 |  +63,406円 | -20,414円 |
+| 2026-05 | 235 | 211 | +151,870円 | -15,918円 |
+| 2026-06 | 226 | 202 |  +37,406円 | -29,312円 |
+| 2026-07 | 224 | 228 |  -10,964円 | -15,303円 |
+| 2026-08 | 221 | 203 |  +70,170円 | -37,201円 |
+| 2026-09 | 175 | 161 | +143,103円 | -42,494円 |
+| **合計** | **1,984** | **1,821** | **+762,295円** | |
+
+- **7月のみマイナス**（-10,964円）
+- 勝率約 52%
+- 月平均 +84,700円
 
 ---
 
@@ -170,186 +216,18 @@ gmo.api.secret=ENC(...)   # 暗号化済み API SECRET
 
 ```
 GET https://api.coin.z.com/public/v1/klines
-  ?symbol=BTC_JPY
-  &interval=1hour
-  &date=YYYYMMDD
+  ?symbol=BTC_JPY&interval=10min&date=YYYYMMDD
 ```
 
 **日付切り替えルール（重要）:**
 - GMO の1日分データは **JST 06:00〜翌 05:55**
-- `date=20240914` → `2024/09/14 06:00 JST 〜 2024/09/15 05:55 JST`
-- JST 06:05 以降を当日、06:04 以前を前日として `date` を生成（`ScheduleGuard.buildKlineDateParam`）
+- `ScheduleGuard.buildKlineDateParam`: JST 06:05 以降を当日、06:04 以前を前日として扱う
+- バックテストの `existsByGmoDate`: JST 06:00〜翌 05:59 の UTC 範囲でチェック
 
-### 注文（Private API・レバレッジ）
+### メンテナンス回避（ScheduleGuard）
 
-| 操作 | エンドポイント | 主なパラメータ |
-|------|-------------|--------------|
-| 新規建て | POST `/v1/order` | `settleType=OPEN`, `executionType=MARKET`, `size`（BTC数量）|
-| 一括決済 | POST `/v1/closeBulkOrder` | `side`=建玉の side（買建て→`BUY`）|
-| キャンセル | POST `/v1/cancelOrder` | `orderId` |
-| 建玉一覧 | GET `/v1/openPositions` | `symbol` |
-| 残高 | GET `/v1/account/assets` | - |
-
-**認証:** `API-KEY` / `API-TIMESTAMP` / `API-SIGN`（HMAC-SHA256）
-**署名対象:** `timestamp + method + path + body`
-
----
-
-## スケジューラ動作
-
-### メンテナンス回避（`ScheduleGuard`）
-
-- **毎週土曜 09:05〜10:59 JST** はスキップ（GMOコイン定期メンテ）
-- `KlineScheduler.run()` と `TradeScheduler.run()` の冒頭で判定
-
-### KLine 取得フロー（`KlineScheduler` → `KlineService`）
-
-```
-1. ScheduleGuard.isMaintenanceTime() → メンテ中はスキップ
-2. buildDateParam(interval, zone)    → JST 06:05 基準で date 生成
-3. GMO API fetchKlines()             → 全シンボルをループ（シンボル間 1 秒待機）
-4. kline_data に UPSERT              → ON CONFLICT DO NOTHING（冪等）
-```
-
-### 自動売買フロー（`TradeScheduler` → `TradingStrategy` → `Executor`）
-
-```
-1. ScheduleGuard.isMaintenanceTime() → メンテ中はスキップ
-2. kline_data から最新終値を取得
-3. TradingStrategy.evaluate()        → 指標計算・シグナル判定・trade_signal 保存
-4. paper-mode に応じて Executor を選択
-   PaperTradeExecutor  → DB 記録のみ
-   TradeExecutor       → GMO Private API で実際に発注
-```
-
----
-
-## 売買ロジック（`TradingStrategy`）
-
-### 指標計算
-
-| 指標 | クラス | 主な判定 |
-|------|--------|---------|
-| RSI | `RsiCalculator` | ≤20=BUY / ≥80=SELL |
-| MACD | `MacdCalculator` | GOLDEN/DEAD/HOLD クロス判定 |
-| DMI | `DmiCalculator` | -DI>+DI かつ ADX≥25=BUY / +DI>-DI かつ ADX≥25=SELL |
-| RCI | `RciCalculator` | ≤-80=BUY / ≥80=SELL |
-| TEMA | `TemaCalculator` | GOLDEN/DEAD クロス判定 |
-
-**TEMA クロス判定:**
-- 乖離率 = (FAST - SLOW) / FAST × 100
-- +0.1% 以上 → SELL / -0.1% 以下 → BUY
-
-**DMI 判定（逆張りロジック）:**
-- BUY: `-DI > +DI` かつ `ADX ≥ 25`（下降トレンドへの反転狙い）
-- SELL: `+DI > -DI` かつ `ADX ≥ 25`
-
-### 売買シグナル（OR 条件）
-
-**売りシグナル:**
-
-| 番号 | 条件 |
-|------|------|
-| ① | RCI≥90 かつ 前回RCI≤60 かつ 前回MACDがGCでない |
-| ② | RCI≥100 かつ 前回RCI≤70 かつ 前回MACDがGCでない |
-| ③ | RSI > 80 かつ MACDがGC |
-| ④ | MACDがGC かつ TEMAがGC かつ RSIシグナル=SELL |
-| ⑤ | MACDがGC かつ 前回TEMAがGC |
-| ⑥ | TEMAがGC かつ 前回MACDがGC |
-| ⑦ | RCIシグナル=SELL かつ TEMAがGC |
-| ⑨ | DMIシグナル=SELL かつ RCIシグナル=SELL かつ RSI≥65 |
-| ⑩ | MACDがGC かつ TEMAがGC かつ DMIシグナル=SELL |
-
-**買いシグナル（GC→DC に置換）:**
-
-| 番号 | 条件 |
-|------|------|
-| ① | RCI≤-90 かつ 前回RCI≥-60 かつ 前回MACDがDCでない |
-| ② | RCI≤-100 かつ 前回RCI≥-70 かつ 前回MACDがDCでない |
-| ③ | RSI < 20 かつ MACDがDC |
-| ④ | MACDがDC かつ TEMAがDC かつ RSIシグナル=BUY |
-| ⑤ | MACDがDC かつ 前回TEMAがDC |
-| ⑥ | TEMAがDC かつ 前回MACDがDC |
-| ⑦ | RCIシグナル=BUY かつ TEMAがDC |
-| ⑨ | DMIシグナル=BUY かつ RCIシグナル=BUY かつ RSI≤35 |
-| ⑩ | MACDがDC かつ TEMAがDC かつ DMIシグナル=BUY |
-
-### 連続シグナルによるドテン
-
-同方向シグナル（HOLD 除く）が **3回連続** したら 3回目を逆方向に反転。
-→ 現ポジション決済（利確）＋逆方向新規建て（ドテン）
-
-### ポジション管理（`PaperTradeExecutor` / `TradeExecutor`）
-
-```
-【ポジションなし】
-  BUY  → 買建て新規
-  SELL → 売建て新規（空売り）
-
-【買建て中】
-  SELL → 買建て決済 → 売建て新規（ドテン）
-  損切り/利確 → 買建て決済のみ
-
-【売建て中】
-  BUY  → 売建て決済 → 買建て新規（ドテン）
-  損切り/利確 → 売建て決済のみ
-```
-
-**損益計算:**
-- 買建て: `(closePrice - openPrice) × size`
-- 売建て: `(openPrice - closePrice) × size`
-- 損切り発動: `変動率 ≤ -stop-loss-percent`
-- 利確発動: `変動率 ≥ take-profit-percent`
-
-**本番注文（`TradeExecutor`）:**
-- 新規建て: `closeBulkOrder` で一括決済（建玉の side を指定）
-- 銘柄コード: `BTC` → `BTC_JPY`（`toLeverageSymbol` が自動変換、二重付与なし）
-
----
-
-## バックテスト
-
-### 起動方法
-
-```cmd
-# ビルド
-mvn clean package -DskipTests
-
-# バックテスト実行
-java -jar target\crypto-bot2-1.0.0.jar ^
-     --backtest ^
-     --start-date=2024-01-01 ^
-     --end-date=2024-12-31
-```
-
-`--start-date` / `--end-date` は必須。未指定の場合はエラー終了。
-初期残高は `gmo.backtest.initial-balance-jpy` で設定。
-
-### 処理フロー
-
-```
-1. 開始日〜終了日をループ
-   → existsByGmoDate() で DB に存在チェック（JST 06:00〜翌 05:59 範囲）
-   → 不足分を GMO API から取得して kline_data に保存
-
-2. fetchRange() で全期間データを JST 06:00 境界で取得
-
-3. 1本ずつシミュレーション
-   → 指標計算（直前 historySize 件を使用）
-   → TradingStrategy と同一ロジックでシグナル判定
-   → trade_signal テーブルにも保存（確認用）
-   → 連続3回ドテン・損切り・利確も同一ロジック
-
-4. backtest_run / backtest_trade テーブルに結果保存
-   → ログにサマリ（損益・勝率・最大DD）を出力
-```
-
-### 結果確認
-
-```sql
-SELECT * FROM backtest_run ORDER BY executed_at DESC LIMIT 5;
-SELECT * FROM backtest_trade WHERE run_id = 1 ORDER BY trade_time;
-```
+- **毎週土曜 09:05〜10:59 JST** はスキップ
+- `KlineScheduler` と `TradeScheduler` の冒頭で判定
 
 ---
 
@@ -359,10 +237,16 @@ SELECT * FROM backtest_trade WHERE run_id = 1 ORDER BY trade_time;
 |---------|------|
 | `kline_data` | ローソク足データ（UNIQUE: symbol, interval_type, open_time）|
 | `trade_signal` | 指標値・シグナル記録（UNIQUE: symbol, signal_time）|
-| `trade_history` | 売買履歴（status: SUCCESS/PAPER/FAILED）|
+| `trade_history` | 売買履歴（profit_jpy カラムあり・決済時のみ値が入る）|
 | `position` | ポジション管理（status: OPEN/CLOSED）|
 | `backtest_run` | バックテスト実行サマリ |
 | `backtest_trade` | バックテスト個別取引履歴 |
+
+**既存 DB への追加が必要なカラム:**
+```sql
+ALTER TABLE trade_history
+ADD COLUMN IF NOT EXISTS profit_jpy NUMERIC(20,2);
+```
 
 ---
 
@@ -370,42 +254,71 @@ SELECT * FROM backtest_trade WHERE run_id = 1 ORDER BY trade_time;
 
 ```
 CRYPTO_MASTER_KEY（環境変数）
-    ↓ PBKDF2WithHmacSHA256（310,000回、固定 salt）
+    ↓ PBKDF2WithHmacSHA256（310,000回）
   AES-256 秘密鍵
     ↓ AES/GCM/NoPadding（IV=12バイトランダム）
   ENC(Base64(IV + 暗号文))
 ```
 
-- `AppConfig.@PostConstruct` で起動時に `secret.properties` の `ENC(...)` 値を復号
-- `secret.properties` 更新後は **必ず再ビルド**（JAR に取り込まれるため）
-- `CRYPTO_MASTER_KEY` を変更した場合は `encrypt-secrets.bat` で再暗号化が必要
+- `AppConfig.@PostConstruct` で起動時に `secret.properties` の `ENC(...)` を復号
+- `secret.properties` 更新後は **必ず再ビルド**
+- 暗号化: `scripts\encrypt-secrets.bat YOUR_API_KEY YOUR_API_SECRET`
 
 ---
 
 ## 起動手順
 
 ```cmd
-rem 1. ビルド
+rem ビルド
 mvn clean package -DskipTests
 
-rem 2. DB 起動（Docker）
-docker run -d --name cryptodb ^
-  -e POSTGRES_DB=cryptodb ^
-  -e POSTGRES_USER=cryptouser ^
-  -e POSTGRES_PASSWORD=your_db_password ^
-  -p 5432:5432 postgres:15
-
-rem 3. APIキー暗号化（初回のみ）
-set CRYPTO_MASTER_KEY=your_strong_password
-scripts\encrypt-secrets.bat YOUR_API_KEY YOUR_API_SECRET
-
-rem 4. 通常起動（スケジューラ稼働）
-set CRYPTO_MASTER_KEY=your_strong_password
+rem 通常起動（スケジューラ稼働）
+set CRYPTO_MASTER_KEY=your_password
 java -jar target\crypto-bot2-1.0.0.jar
 
-rem 5. バックテスト
-set CRYPTO_MASTER_KEY=your_strong_password
-java -jar target\crypto-bot2-1.0.0.jar --backtest --start-date=2024-01-01 --end-date=2024-12-31
+rem バックテスト
+set CRYPTO_MASTER_KEY=your_password
+java -jar target\crypto-bot2-1.0.0.jar ^
+     --backtest ^
+     --start-date=2026-01-01 ^
+     --end-date=2026-09-23
+```
+
+---
+
+## ペーパートレード監視 SQL
+
+```sql
+-- 損益確認
+SELECT 
+    trade_time AT TIME ZONE 'Asia/Tokyo' AS time,
+    side,
+    price,
+    profit_jpy,
+    note,
+    SUM(profit_jpy) OVER (ORDER BY trade_time) AS cumulative_profit
+FROM trade_history
+WHERE trade_time >= '2026-09-24 09:00:00+00'
+  AND status = 'PAPER'
+  AND profit_jpy IS NOT NULL
+ORDER BY trade_time;
+
+-- 現在のオープンポジション
+SELECT symbol, side,
+    open_time AT TIME ZONE 'Asia/Tokyo' AS open_time_jst,
+    open_price, amount
+FROM position
+WHERE status = 'OPEN' AND is_paper = true;
+
+-- 月別損益
+SELECT 
+    TO_CHAR(trade_time AT TIME ZONE 'Asia/Tokyo', 'YYYY-MM') AS month,
+    COUNT(*) FILTER (WHERE profit_jpy > 0) AS win,
+    COUNT(*) FILTER (WHERE profit_jpy < 0) AS loss,
+    SUM(profit_jpy) AS total_profit
+FROM trade_history
+WHERE status = 'PAPER' AND profit_jpy IS NOT NULL
+GROUP BY 1 ORDER BY 1;
 ```
 
 ---
@@ -417,7 +330,7 @@ java -jar target\crypto-bot2-1.0.0.jar --backtest --start-date=2024-01-01 --end-
 - 設定値はすべて `AppProperties` 経由（定数の直書き禁止）
 - 例外は `CryptoBotException` にラップ
 - スケジューラの `run()` は `Throwable` レベルでキャッチ（スレッド死亡防止）
-- APIキー・シークレットはログ出力禁止
+- API KEY・シークレットはログ出力禁止
 
 ## .gitignore 必須項目
 

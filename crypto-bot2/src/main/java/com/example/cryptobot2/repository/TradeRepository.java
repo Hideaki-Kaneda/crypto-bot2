@@ -39,8 +39,8 @@ public class TradeRepository {
 
   private static final String INSERT_TRADE_SQL = """
       INSERT INTO trade_history
-        (symbol, trade_time, side, price, amount, amount_jpy, fee, status, order_id, signal_id, note)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (symbol, trade_time, side, price, amount, amount_jpy, fee, status, order_id, signal_id, note, profit_jpy)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       """;
 
   /**
@@ -62,6 +62,7 @@ public class TradeRepository {
       ps.setString(9, th.getOrderId());
       ps.setObject(10, th.getSignalId());
       ps.setString(11, th.getNote());
+      ps.setBigDecimal(12, th.getProfitJpy());
       return ps;
     }, keyHolder);
 

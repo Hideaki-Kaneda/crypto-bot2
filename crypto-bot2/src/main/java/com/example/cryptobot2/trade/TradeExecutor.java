@@ -9,6 +9,8 @@ import com.example.cryptobot2.model.TradeHistory;
 import com.example.cryptobot2.model.TradeHistory.Side;
 import com.example.cryptobot2.model.TradeHistory.TradeStatus;
 import com.example.cryptobot2.model.TradeSignal;
+import com.example.cryptobot2.model.TradeSignal.CrossSignal;
+import com.example.cryptobot2.model.TradeSignal.Signal;
 import com.example.cryptobot2.repository.TradeRepository;
 import java.math.BigDecimal;
 import java.math.MathContext;
@@ -21,17 +23,22 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
 /**
- * 本番レバレッジ売買実行クラス。空売り・ドテン対応。
+ * 本番レバレッジ売買実行クラス。
  *
- * <p>実行ルール:
+ * <h2>新規建て</h2>
  * <ul>
- *   <li>損切り・利確チェック（最優先）→ 条件達成で決済のみ（ドテンなし）
- *   <li>ポジションなし + BUY  → 買建て新規
- *   <li>ポジションなし + SELL → 売建て新規（空売り）
- *   <li>買建て中     + SELL  → 買建て決済 → 売建て新規（ドテン）
- *   <li>売建て中     + BUY   → 売建て決済 → 買建て新規（ドテン）
- *   <li>同方向シグナル        → スキップ（重複防止）
+ *   <li>ポジションなし + TEMAがGC → 買建て新規</li>
+ *   <li>ポジションなし + TEMAがDC → 売建て新規</li>
+ *   <li>価格反転のみのシグナルでは新規建てしない</li>
  * </ul>
+ *
+ * <h2>利確</h2>
+ * <ul>
+ *   <li>買建て中 + finalSignal=SELL（DC or 価格上昇反転）→ 一括決済</li>
+ *   <li>売建て中 + finalSignal=BUY（GC or 価格下落反転）→ 一括決済</li>
+ * </ul>
+ *
+ * <h2>途転なし・損切りなし</h2>
  */
 @Slf4j
 @Component
@@ -45,52 +52,118 @@ public class TradeExecutor {
   private final TradeRepository tradeRepository;
 
   public void execute(TradeSignal signal) {
-    String symbol    = signal.getSymbol();
-    String levSymbol = toLeverageSymbol(symbol);
-    BigDecimal price = signal.getPrice();
+    String symbol         = signal.getSymbol();
+    String levSymbol      = toLeverageSymbol(symbol);
+    BigDecimal price      = signal.getPrice();
+    Signal finalSignal    = signal.getFinalSignal();
+    CrossSignal temaCross = signal.getTemaCross();
     AppProperties.Trade trade = props.getTrade();
-    TradeSignal.Signal finalSignal = signal.getFinalSignal();
 
-    if (finalSignal == TradeSignal.Signal.HOLD) {
+    if (finalSignal == Signal.HOLD) {
       log.debug("[本番] HOLD: symbol={} price={}", symbol, price);
-    }
-
-    // --- 損切り・利確チェック（最優先）---
-    Optional<Position> openPos = tradeRepository.findOpenPosition(symbol, false);
-    if (openPos.isPresent()) {
-      boolean closed = checkStopOrTakeProfit(openPos.get(), price, trade, levSymbol);
-      if (closed) {
-        // 損切り・利確はドテンなしで終了
-        return;
-      }
-    }
-
-    if (finalSignal == TradeSignal.Signal.HOLD) {
       return;
     }
 
-    // ポジション再取得
-    openPos = tradeRepository.findOpenPosition(symbol, false);
+    boolean isGolden = temaCross == CrossSignal.GOLDEN;
+    boolean isDead   = temaCross == CrossSignal.DEAD;
+    boolean isCross  = isGolden || isDead;
+
+    // クロスが来た時の期待される方向
+    Signal crossSignal = isGolden ? Signal.BUY : isDead ? Signal.SELL : null;
+
+    Optional<Position> openPos = tradeRepository.findOpenPosition(symbol, false);
 
     if (openPos.isEmpty()) {
-      // ポジションなし → 新規建て
-      openNewPosition(symbol, levSymbol, price, trade, finalSignal);
+      // ポジションなし: クロスがあれば新規建て（符号反転のみでは新規なし）
+      if (isCross) {
+        double rciEntryMin = props.getIndicator().getRciEntryMin();
+        double rciEntryMax = props.getIndicator().getRciEntryMax();
+        java.math.BigDecimal rciVal = signal.getRci();
+        boolean rciBlocked = rciVal != null
+            && rciVal.doubleValue() >= rciEntryMin
+            && rciVal.doubleValue() <= rciEntryMax;
+        if (rciBlocked) {
+          log.info("[本番] 新規建てスキップ（RCI={} は範囲[{},{}]内）: symbol={} cross={}",
+              rciVal, rciEntryMin, rciEntryMax, symbol, temaCross);
+        } else {
+          boolean flipToMinus = finalSignal == Signal.SELL && isGolden;
+          boolean flipToPlus  = finalSignal == Signal.BUY  && isDead;
+          boolean flipped     = flipToMinus || flipToPlus;
+
+          Side side;
+          if (flipped) {
+            side = finalSignal == Signal.BUY ? Side.BUY : Side.SELL;
+            log.info("[本番] 新規建て（クロス+符号反転逆転）: symbol={} cross={} side={}",
+                symbol, temaCross, side);
+          } else {
+            side = isGolden ? Side.BUY : Side.SELL;
+          }
+          openNewPosition(symbol, levSymbol, price, trade, side);
+        }
+      } else {
+        log.debug("[本番] 新規建てスキップ（クロスなし）: symbol={} cross={} signal={}",
+            symbol, temaCross, finalSignal);
+      }
     } else {
       Position pos = openPos.get();
-      Side currentSide = pos.getSide();
-      boolean isReverse =
-          (currentSide == Side.BUY  && finalSignal == TradeSignal.Signal.SELL) ||
-          (currentSide == Side.SELL && finalSignal == TradeSignal.Signal.BUY);
 
-      if (isReverse) {
-        // 逆方向 → 決済してドテン
-        log.info("[本番] ドテン: symbol={} {} → {}",
-            symbol, currentSide, finalSignal);
-        closeLeveragePosition(pos, price, levSymbol, CloseReason.SIGNAL);
-        openNewPosition(symbol, levSymbol, price, trade, finalSignal);
+      // 損切りチェック（最優先）
+      if (checkStopLoss(pos, price, trade, levSymbol)) {
+        return;
+      }
+
+      // 利確判定: クロス方向を優先、クロスなしは finalSignal で判定
+      Signal crossOrFinal = (crossSignal != null) ? crossSignal : finalSignal;
+      boolean shouldClose =
+          (pos.getSide() == Side.BUY  && crossOrFinal == Signal.SELL) ||
+          (pos.getSide() == Side.SELL && crossOrFinal == Signal.BUY);
+
+      if (shouldClose) {
+        String reason;
+        if (pos.getSide() == Side.BUY) {
+          reason = isDead ? "TEMA_DEAD" : "価格反転(+)";
+        } else {
+          reason = isGolden ? "TEMA_GOLDEN" : "価格反転(-)";
+        }
+
+        // 符号反転による利確の場合、最低保有本数チェック
+        if (!isCross && isFlipCloseBlocked(pos, signal.getSignalTime(), reason, trade)) {
+          log.debug("[本番] 符号反転利確スキップ（保有本数不足）: symbol={} reason={}", symbol, reason);
+        } else {
+          // 利確決済
+          closeLeveragePosition(pos, price, levSymbol, CloseReason.SIGNAL, reason);
+
+          // クロスがある場合は利確直後に逆方向で新規建て
+          if (isCross) {
+            double rciEntryMin2 = props.getIndicator().getRciEntryMin();
+            double rciEntryMax2 = props.getIndicator().getRciEntryMax();
+            java.math.BigDecimal rciVal2 = signal.getRci();
+            boolean rciBlocked2 = rciVal2 != null
+                && rciVal2.doubleValue() >= rciEntryMin2
+                && rciVal2.doubleValue() <= rciEntryMax2;
+
+            // EMA トレンドフィルター（利確後新規建てにも適用）
+            Side newSide = isGolden ? Side.BUY : Side.SELL;
+            boolean emaBlockedNew = (newSide == Side.BUY  && !signal.isEmaBullish())
+                                 || (newSide == Side.SELL && !signal.isEmaBearish());
+
+            if (rciBlocked2) {
+              log.info("[本番] 利確後新規建てスキップ（RCI={} は範囲[{},{}]内）: symbol={} cross={}",
+                  rciVal2, rciEntryMin2, rciEntryMax2, symbol, temaCross);
+            } else if (emaBlockedNew) {
+              log.info("[本番] 利確後新規建てスキップ（EMAトレンド逆行）: symbol={} side={}", symbol, newSide);
+            } else {
+              log.info("[本番] 利確後即新規建て: symbol={} side={} reason={}",
+                  symbol, newSide, reason);
+              openNewPosition(symbol, levSymbol, price, trade, newSide);
+            }
+          }
+          // 符号反転のみの場合は利確のみ（新規なし）
+        }
+
       } else {
-        log.info("[本番] スキップ（同方向ポジションあり）: symbol={} side={} signal={}",
-            symbol, currentSide, finalSignal);
+        log.debug("[本番] スキップ: symbol={} side={} finalSignal={} temaCross={}",
+            symbol, pos.getSide(), finalSignal, temaCross);
       }
     }
   }
@@ -99,15 +172,10 @@ public class TradeExecutor {
   // Private
   // -----------------------------------------------------------------------
 
-  /**
-   * 新規建て（BUY / SELL 共通）。
-   */
   private void openNewPosition(String symbol, String levSymbol,
-      BigDecimal price, AppProperties.Trade trade, TradeSignal.Signal signal) {
+      BigDecimal price, AppProperties.Trade trade, Side side) {
 
-    Side side = signal == TradeSignal.Signal.BUY ? Side.BUY : Side.SELL;
-    String apiSide   = side.name(); // "BUY" or "SELL"
-    BigDecimal size  = trade.getSize();
+    BigDecimal size      = trade.getSize();
     BigDecimal amountJpy = price.multiply(size, MC).setScale(0, RoundingMode.HALF_UP);
 
     String orderId = null;
@@ -115,7 +183,7 @@ public class TradeExecutor {
     String note = null;
 
     try {
-      orderId = privateApiClient.openLeverageOrder(levSymbol, apiSide, size);
+      orderId = privateApiClient.openLeverageOrder(levSymbol, side.name(), size);
     } catch (CryptoBotException e) {
       status = TradeStatus.FAILED;
       note = "新規建て失敗: " + e.getMessage();
@@ -156,56 +224,15 @@ public class TradeExecutor {
     }
   }
 
-  /**
-   * 損切り・利確チェック。
-   * SELL建て（空売り）は価格上昇が損失になるため符号を反転して計算する。
-   */
-  private boolean checkStopOrTakeProfit(
-      Position pos, BigDecimal currentPrice, AppProperties.Trade trade, String levSymbol) {
+  private void closeLeveragePosition(Position pos, BigDecimal closePrice,
+      String levSymbol, CloseReason reason, String detail) {
 
-    BigDecimal openPrice = pos.getOpenPrice();
-    double changePercent = currentPrice.subtract(openPrice)
-        .divide(openPrice, MC)
-        .multiply(BigDecimal.valueOf(100))
-        .doubleValue();
-
-    if (pos.getSide() == Side.SELL) {
-      changePercent = -changePercent;
-    }
-
-    if (changePercent <= -Math.abs(trade.getStopLossPercent())) {
-      log.info("[本番] 損切り発動: symbol={} side={} change={}%",
-          pos.getSymbol(), pos.getSide(), String.format("%.2f", changePercent));
-      closeLeveragePosition(pos, currentPrice, levSymbol, CloseReason.STOP_LOSS);
-      return true;
-    }
-
-    if (changePercent >= trade.getTakeProfitPercent()) {
-      log.info("[本番] 利確発動: symbol={} side={} change={}%",
-          pos.getSymbol(), pos.getSide(), String.format("%.2f", changePercent));
-      closeLeveragePosition(pos, currentPrice, levSymbol, CloseReason.TAKE_PROFIT);
-      return true;
-    }
-
-    return false;
-  }
-
-  /**
-   * 一括決済。
-   * 売建て（空売り）の損益は (openPrice - closePrice) × amount。
-   */
-  private void closeLeveragePosition(
-      Position pos, BigDecimal closePrice, String levSymbol, CloseReason reason) {
-
-    String symbol    = pos.getSymbol();
-    String buildSide = pos.getSide().name(); // closeBulkOrder は建玉 side を指定
-
-    // 決済側の side（買建て→SELL で決済 / 売建て→BUY で決済）
-    Side closeSide = pos.getSide() == Side.BUY ? Side.SELL : Side.BUY;
+    String buildSide = pos.getSide().name();
+    Side closeSide   = pos.getSide() == Side.BUY ? Side.SELL : Side.BUY;
 
     String orderId = null;
     TradeStatus status = TradeStatus.SUCCESS;
-    String note = "reason=" + reason;
+    String note = "reason=" + detail;
 
     try {
       orderId = privateApiClient.closeBulkOrder(levSymbol, buildSide);
@@ -218,19 +245,16 @@ public class TradeExecutor {
     BigDecimal profitJpy;
     if (pos.getSide() == Side.BUY) {
       profitJpy = closePrice.subtract(pos.getOpenPrice())
-          .multiply(pos.getAmount(), MC)
-          .setScale(0, RoundingMode.HALF_UP);
+          .multiply(pos.getAmount(), MC).setScale(0, RoundingMode.HALF_UP);
     } else {
-      // 空売り: 建値 - 決済値
       profitJpy = pos.getOpenPrice().subtract(closePrice)
-          .multiply(pos.getAmount(), MC)
-          .setScale(0, RoundingMode.HALF_UP);
+          .multiply(pos.getAmount(), MC).setScale(0, RoundingMode.HALF_UP);
     }
 
     OffsetDateTime now = now();
 
     TradeHistory th = TradeHistory.builder()
-        .symbol(symbol)
+        .symbol(pos.getSymbol())
         .tradeTime(now)
         .side(closeSide)
         .price(closePrice)
@@ -240,15 +264,83 @@ public class TradeExecutor {
         .status(status)
         .orderId(orderId)
         .note(note + " levSymbol=" + levSymbol)
+        .profitJpy(profitJpy)
         .build();
 
     tradeRepository.saveTradeHistory(th);
 
     if (status == TradeStatus.SUCCESS) {
       tradeRepository.closePosition(pos.getId(), now, closePrice, profitJpy, reason);
-      log.info("[本番] 決済{}: levSymbol={} openPrice={} closePrice={} profitJpy={} reason={}",
-          closeSide, levSymbol, pos.getOpenPrice(), closePrice, profitJpy, reason);
+      log.info("[本番] 利確{}: levSymbol={} openPrice={} closePrice={} profitJpy={} reason={}",
+          closeSide, levSymbol, pos.getOpenPrice(), closePrice, profitJpy, detail);
     }
+  }
+
+  private boolean checkStopLoss(Position pos, BigDecimal price,
+      AppProperties.Trade trade, String levSymbol) {
+    java.math.BigDecimal stopLossJpy = trade.getStopLossJpy();
+    if (stopLossJpy == null || stopLossJpy.compareTo(java.math.BigDecimal.ZERO) == 0) {
+      return false;
+    }
+
+    BigDecimal unrealizedPnl;
+    if (pos.getSide() == Side.BUY) {
+      unrealizedPnl = price.subtract(pos.getOpenPrice()).multiply(pos.getAmount(), MC)
+          .setScale(0, RoundingMode.HALF_UP);
+    } else {
+      unrealizedPnl = pos.getOpenPrice().subtract(price).multiply(pos.getAmount(), MC)
+          .setScale(0, RoundingMode.HALF_UP);
+    }
+
+    if (unrealizedPnl.compareTo(stopLossJpy) <= 0) {
+      log.info("[本番] 損切り発動: symbol={} side={} openPrice={} currentPrice={} unrealizedPnl={}",
+          pos.getSymbol(), pos.getSide(), pos.getOpenPrice(), price, unrealizedPnl);
+      closeLeveragePosition(pos, price, levSymbol, CloseReason.STOP_LOSS, "損切り");
+      return true;
+    }
+    return false;
+  }
+
+  private boolean isFlipCloseBlocked(Position pos, java.time.OffsetDateTime signalTime,
+      String reason, AppProperties.Trade trade) {
+
+    int minBars;
+    if ("価格反転(-)".equals(reason)) {
+      minBars = trade.getFlipCloseSellMinBars();
+    } else if ("価格反転(+)".equals(reason)) {
+      minBars = trade.getFlipCloseBuyMinBars();
+    } else {
+      return false;
+    }
+
+    if (minBars <= 0) return false;
+
+    long intervalMinutes = toIntervalMinutes(props.getKline().getInterval());
+    long elapsedMinutes = java.time.Duration.between(pos.getOpenTime(), signalTime).toMinutes();
+    long holdBars = elapsedMinutes / intervalMinutes;
+
+    if (holdBars < minBars) {
+      log.debug("[本番] 符号反転利確スキップ: reason={} holdBars={} minBars={}",
+          reason, holdBars, minBars);
+      return true;
+    }
+    return false;
+  }
+
+  private long toIntervalMinutes(String interval) {
+    return switch (interval) {
+      case "1min"   ->    1L;
+      case "5min"   ->    5L;
+      case "10min"  ->   10L;
+      case "15min"  ->   15L;
+      case "30min"  ->   30L;
+      case "1hour"  ->   60L;
+      case "4hour"  ->  240L;
+      case "8hour"  ->  480L;
+      case "12hour" ->  720L;
+      case "1day"   -> 1440L;
+      default       ->   10L;
+    };
   }
 
   private String toLeverageSymbol(String symbol) {

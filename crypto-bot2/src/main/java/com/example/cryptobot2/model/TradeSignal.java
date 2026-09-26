@@ -58,6 +58,11 @@ public class TradeSignal {
   @Builder.Default
   private Signal finalSignal = Signal.HOLD;
 
+  @Builder.Default
+  private boolean emaBullish = true;
+  @Builder.Default
+  private boolean emaBearish = true;
+
   /** 買い/売り/様子見シグナル */
   public enum Signal {
     BUY, SELL, HOLD
