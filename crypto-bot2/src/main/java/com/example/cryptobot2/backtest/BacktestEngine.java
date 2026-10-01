@@ -19,6 +19,7 @@ import com.example.cryptobot2.repository.BacktestRepository;
 import com.example.cryptobot2.repository.BacktestResultRepository;
 import com.example.cryptobot2.repository.KlineRepository;
 import com.example.cryptobot2.repository.TradeSignalRepository;
+import com.example.cryptobot2.service.TradingConfigService;
 import com.example.cryptobot2.util.ScheduleGuard;
 import java.math.BigDecimal;
 import java.math.MathContext;
@@ -63,6 +64,7 @@ public class BacktestEngine {
   private final BacktestRepository backtestRepository;
   private final BacktestResultRepository resultRepository;
   private final TradeSignalRepository signalRepository;
+  private final TradingConfigService tradingConfigService;
 
   /**
    * バックテストを実行する。
@@ -71,6 +73,9 @@ public class BacktestEngine {
    * @param endDateStr   終了日（yyyy-MM-dd）
    */
   public void run(String startDateStr, String endDateStr) {
+    // DB から最新設定を読み込む（バックテストも動的設定を反映する）
+    tradingConfigService.reload(props);
+
     String symbol   = props.getKline().getSymbols().get(0);
     String interval = props.getKline().getInterval();
     BigDecimal initialBalance = props.getBacktest().getInitialBalanceJpy();
@@ -85,9 +90,9 @@ public class BacktestEngine {
     fetchMissingKlineData(symbol, interval, startDate, endDate);
 
     // Step2: 対象期間の kline_data を全件取得
-    // GMO の date=startDate は JST startDate 06:00 〜 (endDate+1) 05:55 のデータを含む
-    // UTC に変換: JST 06:00 = UTC 前日 21:00
-    OffsetDateTime from = startDate.atTime(6, 0)
+    // startDate の JST 00:00〜05:55 は GMO の date=startDate-1 に含まれるため
+    // from は startDate の JST 00:00（= UTC 前日 15:00）から取得する
+    OffsetDateTime from = startDate.atTime(0, 0)
         .atOffset(java.time.ZoneOffset.ofHours(9))
         .withOffsetSameInstant(ZoneOffset.UTC);
     OffsetDateTime to = endDate.plusDays(1).atTime(6, 0)
@@ -122,7 +127,10 @@ public class BacktestEngine {
     log.info("KLineデータ補完チェック開始...");
     int fetched = 0;
 
-    LocalDate cursor = startDate;
+    // GMO の date=YYYYMMDD は JST 06:00〜翌 05:55 のデータを返す。
+    // startDate の 00:00〜05:55（JST）は前日の date= に含まれるため、
+    // 前日から取得を開始する。
+    LocalDate cursor = startDate.minusDays(1);
     while (!cursor.isAfter(endDate)) {
       if (!backtestRepository.existsByGmoDate(symbol, interval, cursor)) {
         String dateParam = buildDateParam(interval, cursor);
@@ -174,9 +182,15 @@ public class BacktestEngine {
   private SimulationResult simulate(String symbol, String interval,
       List<KlineRecord> klines, BigDecimal initialBalance) {
 
-    AppProperties.Indicator ind = props.getIndicator();
-    AppProperties.Trade trade   = props.getTrade();
+    AppProperties.Indicator ind   = props.getIndicator();
+    AppProperties.Trade trade     = props.getTrade();
     int historySize = ind.getPriceHistorySize();
+
+    // 日次損益制限設定
+    BigDecimal dailyProfitLimit = trade.getDailyProfitLimit();
+    BigDecimal dailyLossLimit   = trade.getDailyLossLimit();
+    boolean hasDailyLimit = (dailyProfitLimit != null && dailyProfitLimit.compareTo(BigDecimal.ZERO) != 0)
+                         || (dailyLossLimit   != null && dailyLossLimit.compareTo(BigDecimal.ZERO) != 0);
 
     List<BacktestResult.Trade> trades = new ArrayList<>();
 
@@ -186,10 +200,30 @@ public class BacktestEngine {
 
     VirtualPosition position = null;
 
+    // 日次損益管理
+    java.time.LocalDate currentDay = null;
+    BigDecimal dailyPnl = BigDecimal.ZERO;  // 当日累積損益
+    boolean dailyLimitReached = false;       // 当日制限到達フラグ
+
     for (int i = 0; i < klines.size(); i++) {
       KlineRecord current = klines.get(i);
       BigDecimal price    = current.getClose();
       OffsetDateTime time = current.getOpenTime();
+
+      // 日付切り替えチェック（JST 06:00 基準）
+      java.time.ZonedDateTime jst = time.atZoneSameInstant(
+          java.time.ZoneId.of("Asia/Tokyo"));
+      java.time.LocalDate jstDate = jst.getHour() < 6
+          ? jst.toLocalDate().minusDays(1)
+          : jst.toLocalDate();
+
+      if (!jstDate.equals(currentDay)) {
+        // 日付が変わったら日次集計をリセット
+        currentDay = jstDate;
+        dailyPnl = BigDecimal.ZERO;
+        dailyLimitReached = false;
+        log.debug("[BT] 日次リセット: date={}", jstDate);
+      }
 
       List<KlineRecord> history = getHistory(klines, i, historySize);
       if (history.size() < 2) continue;
@@ -304,6 +338,10 @@ public class BacktestEngine {
         boolean isGolden = temaCross == CrossSignal.GOLDEN;
         boolean isDead   = temaCross == CrossSignal.DEAD;
         if (isGolden || isDead) {
+          // 日次損益制限チェック（新規建てのみ制限、利確は制限なし）
+          if (dailyLimitReached) {
+            log.debug("[BT] 日次制限により新規建てスキップ: date={} dailyPnl={}", currentDay, dailyPnl);
+          } else {
           // RCI フィルター: RCI が [rciEntryMin, rciEntryMax] 範囲内は新規建てしない
           double rciEntryMin = ind.getRciEntryMin();
           double rciEntryMax = ind.getRciEntryMax();
@@ -332,7 +370,8 @@ public class BacktestEngine {
             log.debug("[BT] {}: time={} price={}", label, time, price);
           }
         }
-        // 符号反転のみのシグナルはポジションなしでは無視
+          // 符号反転のみのシグナルはポジションなしでは無視
+          } // end dailyLimitReached check
 
       } else {
         // ポジションあり
@@ -354,6 +393,7 @@ public class BacktestEngine {
           if (unrealizedPnl.compareTo(stopLossJpy) <= 0) {
             BigDecimal profit = calcProfit(position, price);
             balance = balance.add(profit);
+            dailyPnl = dailyPnl.add(profit);
             trades.add(buildTrade(symbol, time, closeSide(position.side()),
                 price, trade.getSize(), profit, balance, CloseReason.STOP_LOSS, "損切り"));
             log.debug("[BT] 損切り: time={} side={} unrealizedPnl={}", time, position.side(), unrealizedPnl);
@@ -383,16 +423,26 @@ public class BacktestEngine {
             reason = isGolden ? "TEMA_GOLDEN" : "価格反転(-)";
           }
 
-          // 符号反転による利確の場合、最低保有本数チェック
           boolean flipBlocked = !isCross && isFlipCloseBlocked(
               position.openTime(), time, reason, trade, ind);
 
           if (flipBlocked) {
             log.debug("[BT] 符号反転利確スキップ（保有本数不足）: time={} reason={}", time, reason);
           } else {
-            // 利確決済
             BigDecimal profit = calcProfit(position, price);
             balance = balance.add(profit);
+            dailyPnl = dailyPnl.add(profit);
+            if (hasDailyLimit) {
+              if (dailyProfitLimit != null && dailyProfitLimit.compareTo(BigDecimal.ZERO) > 0
+                  && dailyPnl.compareTo(dailyProfitLimit) >= 0) {
+                dailyLimitReached = true;
+                log.debug("[BT] 日次利益上限到達: date={} dailyPnl={}", currentDay, dailyPnl);
+              } else if (dailyLossLimit != null && dailyLossLimit.compareTo(BigDecimal.ZERO) < 0
+                  && dailyPnl.compareTo(dailyLossLimit) <= 0) {
+                dailyLimitReached = true;
+                log.debug("[BT] 日次損失下限到達: date={} dailyPnl={}", currentDay, dailyPnl);
+              }
+            }
             trades.add(buildTrade(symbol, time, closeSide(position.side()),
                 price, trade.getSize(), profit, balance, CloseReason.SIGNAL, reason));
             log.debug("[BT] 利確: time={} side={} profit={} reason={} temaCross={}",
@@ -400,12 +450,11 @@ public class BacktestEngine {
             position = null;
 
             // クロスがある場合は利確直後に逆方向で新規建て
-            if (isCross) {
+            if (isCross && !dailyLimitReached) {
               boolean rciBlocked2 = rciVal != null
                   && rciVal.doubleValue() >= ind.getRciEntryMin()
                   && rciVal.doubleValue() <= ind.getRciEntryMax();
 
-              // EMA トレンドフィルター（利確後新規建てにも適用）
               Side newSide = isGolden ? Side.BUY : Side.SELL;
               boolean emaBlockedNew = (newSide == Side.BUY && !emaBullish)
                   || (newSide == Side.SELL && !emaBearish);
@@ -424,7 +473,6 @@ public class BacktestEngine {
                 log.debug("[BT] 利確後即新規{}: time={} price={}", newSide, time, price);
               }
             }
-            // 符号反転のみの場合は利確のみ（新規なし）
           }
         }
         // スキップ（同方向）

@@ -51,6 +51,11 @@ public class TradeExecutor {
   private final GmoCoinPrivateApiClient privateApiClient;
   private final TradeRepository tradeRepository;
 
+  // 日次損益管理（JST 06:00 基準でリセット）
+  private java.time.LocalDate dailyResetDate = null;
+  private java.math.BigDecimal dailyPnl      = java.math.BigDecimal.ZERO;
+  private boolean dailyLimitReached          = false;
+
   public void execute(TradeSignal signal) {
     String symbol         = signal.getSymbol();
     String levSymbol      = toLeverageSymbol(symbol);
@@ -58,6 +63,30 @@ public class TradeExecutor {
     Signal finalSignal    = signal.getFinalSignal();
     CrossSignal temaCross = signal.getTemaCross();
     AppProperties.Trade trade = props.getTrade();
+
+    // 日次損益リセットチェック（JST 06:00 基準）
+    java.time.ZonedDateTime jst2 = signal.getSignalTime()
+        .atZoneSameInstant(java.time.ZoneId.of("Asia/Tokyo"));
+    java.time.LocalDate jstDate2 = jst2.getHour() < 6
+        ? jst2.toLocalDate().minusDays(1) : jst2.toLocalDate();
+    if (!jstDate2.equals(dailyResetDate)) {
+      dailyResetDate    = jstDate2;
+      dailyPnl          = java.math.BigDecimal.ZERO;
+      dailyLimitReached = false;
+      log.debug("[本番] 日次リセット: date={}", jstDate2);
+    }
+
+    // 日次損益リセットチェック（JST 06:00 基準）
+    java.time.ZonedDateTime jst = signal.getSignalTime()
+        .atZoneSameInstant(java.time.ZoneId.of("Asia/Tokyo"));
+    java.time.LocalDate jstDate = jst.getHour() < 6
+        ? jst.toLocalDate().minusDays(1) : jst.toLocalDate();
+    if (!jstDate.equals(dailyResetDate)) {
+      dailyResetDate    = jstDate;
+      dailyPnl          = java.math.BigDecimal.ZERO;
+      dailyLimitReached = false;
+      log.debug("[本番] 日次リセット: date={}", jstDate);
+    }
 
     if (finalSignal == Signal.HOLD) {
       log.debug("[本番] HOLD: symbol={} price={}", symbol, price);
@@ -76,6 +105,10 @@ public class TradeExecutor {
     if (openPos.isEmpty()) {
       // ポジションなし: クロスがあれば新規建て（符号反転のみでは新規なし）
       if (isCross) {
+        // 日次損益制限チェック
+        if (dailyLimitReached) {
+          log.info("[本番] 日次制限により新規建てスキップ: symbol={} dailyPnl={}", symbol, dailyPnl);
+        } else {
         double rciEntryMin = props.getIndicator().getRciEntryMin();
         double rciEntryMax = props.getIndicator().getRciEntryMax();
         java.math.BigDecimal rciVal = signal.getRci();
@@ -100,6 +133,7 @@ public class TradeExecutor {
           }
           openNewPosition(symbol, levSymbol, price, trade, side);
         }
+        } // end dailyLimitReached check
       } else {
         log.debug("[本番] 新規建てスキップ（クロスなし）: symbol={} cross={} signal={}",
             symbol, temaCross, finalSignal);
@@ -126,15 +160,18 @@ public class TradeExecutor {
           reason = isGolden ? "TEMA_GOLDEN" : "価格反転(-)";
         }
 
-        // 符号反転による利確の場合、最低保有本数チェック
         if (!isCross && isFlipCloseBlocked(pos, signal.getSignalTime(), reason, trade)) {
           log.debug("[本番] 符号反転利確スキップ（保有本数不足）: symbol={} reason={}", symbol, reason);
         } else {
-          // 利確決済
           closeLeveragePosition(pos, price, levSymbol, CloseReason.SIGNAL, reason);
+          // 日次損益更新
+          BigDecimal closedProfit = pos.getSide() == Side.BUY
+              ? price.subtract(pos.getOpenPrice()).multiply(pos.getAmount(), MC)
+              : pos.getOpenPrice().subtract(price).multiply(pos.getAmount(), MC);
+          dailyPnl = dailyPnl.add(closedProfit.setScale(0, java.math.RoundingMode.HALF_UP));
+          checkDailyLimit(trade);
 
-          // クロスがある場合は利確直後に逆方向で新規建て
-          if (isCross) {
+          if (isCross && !dailyLimitReached) {
             double rciEntryMin2 = props.getIndicator().getRciEntryMin();
             double rciEntryMax2 = props.getIndicator().getRciEntryMax();
             java.math.BigDecimal rciVal2 = signal.getRci();
@@ -142,7 +179,6 @@ public class TradeExecutor {
                 && rciVal2.doubleValue() >= rciEntryMin2
                 && rciVal2.doubleValue() <= rciEntryMax2;
 
-            // EMA トレンドフィルター（利確後新規建てにも適用）
             Side newSide = isGolden ? Side.BUY : Side.SELL;
             boolean emaBlockedNew = (newSide == Side.BUY  && !signal.isEmaBullish())
                                  || (newSide == Side.SELL && !signal.isEmaBearish());
@@ -158,7 +194,6 @@ public class TradeExecutor {
               openNewPosition(symbol, levSymbol, price, trade, newSide);
             }
           }
-          // 符号反転のみの場合は利確のみ（新規なし）
         }
 
       } else {
@@ -299,6 +334,22 @@ public class TradeExecutor {
       return true;
     }
     return false;
+  }
+
+  /** 日次損益が上下限に達したら dailyLimitReached を true にする */
+  private void checkDailyLimit(AppProperties.Trade trade) {
+    java.math.BigDecimal profitLimit = trade.getDailyProfitLimit();
+    java.math.BigDecimal lossLimit   = trade.getDailyLossLimit();
+
+    if (profitLimit != null && profitLimit.compareTo(java.math.BigDecimal.ZERO) > 0
+        && dailyPnl.compareTo(profitLimit) >= 0) {
+      dailyLimitReached = true;
+      log.info("[本番] 日次利益上限到達: date={} dailyPnl={} limit={}", dailyResetDate, dailyPnl, profitLimit);
+    } else if (lossLimit != null && lossLimit.compareTo(java.math.BigDecimal.ZERO) < 0
+        && dailyPnl.compareTo(lossLimit) <= 0) {
+      dailyLimitReached = true;
+      log.info("[本番] 日次損失下限到達: date={} dailyPnl={} limit={}", dailyResetDate, dailyPnl, lossLimit);
+    }
   }
 
   private boolean isFlipCloseBlocked(Position pos, java.time.OffsetDateTime signalTime,

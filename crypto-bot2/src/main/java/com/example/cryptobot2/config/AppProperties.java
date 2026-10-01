@@ -111,6 +111,20 @@ public class AppProperties {
     private int flipCloseBuyMinBars = 4;
 
     /**
+     * 1日の損益上限（JPY）。
+     * 当日の累積損益がこの値以上になったらその日の新規エントリーを停止する。
+     * 0 = 制限なし。
+     */
+    private java.math.BigDecimal dailyProfitLimit = new java.math.BigDecimal("0");
+
+    /**
+     * 1日の損益下限（JPY）。
+     * 当日の累積損益がこの値以下になったらその日の新規エントリーを停止する。
+     * 0 = 制限なし。
+     */
+    private java.math.BigDecimal dailyLossLimit = new java.math.BigDecimal("0");
+
+    /**
      * レバレッジ取引の銘柄コードサフィックス。
      * GMOコインのレバレッジ銘柄は "BTC_JPY" 形式。
      */

@@ -3,6 +3,7 @@ package com.example.cryptobot2.scheduler;
 import com.example.cryptobot2.config.AppProperties;
 import com.example.cryptobot2.exception.CryptoBotException;
 import com.example.cryptobot2.model.TradeSignal;
+import com.example.cryptobot2.service.TradingConfigService;
 import com.example.cryptobot2.trade.PaperTradeExecutor;
 import com.example.cryptobot2.trade.TradeExecutor;
 import com.example.cryptobot2.strategy.TradingStrategy;
@@ -40,6 +41,7 @@ public class TradeScheduler {
       """;
 
   private final AppProperties props;
+  private final TradingConfigService tradingConfigService;
   private final TradingStrategy tradingStrategy;
   private final PaperTradeExecutor paperTradeExecutor;
   private final TradeExecutor tradeExecutor;
@@ -56,6 +58,9 @@ public class TradeScheduler {
       return;
     }
 
+    // DB から最新設定を読み込む（再起動なしに設定変更を反映）
+    tradingConfigService.reload(props);
+
     List<String> symbols = props.getKline().getSymbols();
     String interval = props.getKline().getInterval();
     boolean isPaper = props.getTrade().isPaperMode();
@@ -71,8 +76,15 @@ public class TradeScheduler {
           continue;
         }
 
-        OffsetDateTime now = OffsetDateTime.now(ZoneId.of(props.getScheduler().getTimezone()));
-        TradeSignal signal = tradingStrategy.evaluate(symbol, interval, latestPrice, now);
+        // signalTime は最新 kline の open_time を使う
+        // （バックテストと同じ基準にすることで trade_signal の時系列整合性を保つ）
+        OffsetDateTime signalTime = fetchLatestOpenTime(symbol, interval);
+        if (signalTime == null) {
+          log.warn("最新open_timeが取得できませんでした。symbol={} interval={}", symbol, interval);
+          continue;
+        }
+
+        TradeSignal signal = tradingStrategy.evaluate(symbol, interval, latestPrice, signalTime);
 
         log.info("symbol={} finalSignal={} price={} mode={}",
             symbol, signal.getFinalSignal(), latestPrice, isPaper ? "PAPER" : "本番");
@@ -91,9 +103,23 @@ public class TradeScheduler {
     }
   }
 
+  private static final String LATEST_OPEN_TIME_SQL = """
+      SELECT open_time FROM kline_data
+      WHERE symbol = ? AND interval_type = ?
+      ORDER BY open_time DESC
+      LIMIT 1
+      """;
+
   private BigDecimal fetchLatestPrice(String symbol, String interval) {
     List<BigDecimal> result = jdbcTemplate.queryForList(
         LATEST_PRICE_SQL, BigDecimal.class, symbol, interval);
     return result.isEmpty() ? null : result.get(0);
+  }
+
+  private OffsetDateTime fetchLatestOpenTime(String symbol, String interval) {
+    List<java.sql.Timestamp> result = jdbcTemplate.queryForList(
+        LATEST_OPEN_TIME_SQL, java.sql.Timestamp.class, symbol, interval);
+    if (result.isEmpty() || result.get(0) == null) return null;
+    return result.get(0).toInstant().atOffset(java.time.ZoneOffset.UTC);
   }
 }

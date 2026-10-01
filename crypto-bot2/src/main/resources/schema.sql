@@ -133,6 +133,7 @@ CREATE TABLE IF NOT EXISTS trade_history (
     order_id        VARCHAR(100),               -- 取引所の注文ID
     signal_id       BIGINT          REFERENCES trade_signal(id),
     note            TEXT,
+    profit_jpy      NUMERIC(20,2),              -- 損益（JPY）決済時のみ
     created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW()
 );
 
@@ -163,3 +164,51 @@ CREATE TABLE IF NOT EXISTS position (
 
 CREATE INDEX IF NOT EXISTS idx_position_symbol_status
     ON position (symbol, status, open_time DESC);
+
+-- ------------------------------------------------------------
+-- 動的設定テーブル（スケジューラ実行ごとに再読み込み）
+-- ------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS trading_config (
+    key         VARCHAR(100)  PRIMARY KEY,
+    value       VARCHAR(500)  NOT NULL,
+    description TEXT,
+    updated_at  TIMESTAMPTZ   NOT NULL DEFAULT NOW()
+);
+
+-- デフォルト値を挿入（存在しない場合のみ）
+INSERT INTO trading_config (key, value, description) VALUES
+  ('trade.paper-mode',               'true',   'ペーパートレードモード（true/false）')
+  ON CONFLICT (key) DO NOTHING;
+INSERT INTO trading_config (key, value, description) VALUES
+  ('trade.size',                     '0.1',    '発注数量（BTC単位）')
+  ON CONFLICT (key) DO NOTHING;
+INSERT INTO trading_config (key, value, description) VALUES
+  ('trade.stop-loss-jpy',            '0',      '損切り金額（円）。0=なし')
+  ON CONFLICT (key) DO NOTHING;
+INSERT INTO trading_config (key, value, description) VALUES
+  ('trade.flip-close-sell-min-bars', '0',      '符号反転利確の最低保有本数（売建て）')
+  ON CONFLICT (key) DO NOTHING;
+INSERT INTO trading_config (key, value, description) VALUES
+  ('trade.flip-close-buy-min-bars',  '0',      '符号反転利確の最低保有本数（買建て）')
+  ON CONFLICT (key) DO NOTHING;
+INSERT INTO trading_config (key, value, description) VALUES
+  ('indicator.signal-reverse',       'true',   'シグナル反転（true=GC→売/DC→買）')
+  ON CONFLICT (key) DO NOTHING;
+INSERT INTO trading_config (key, value, description) VALUES
+  ('indicator.ema-trend-period',     '20',     'EMAトレンドフィルター期間（0=なし）')
+  ON CONFLICT (key) DO NOTHING;
+INSERT INTO trading_config (key, value, description) VALUES
+  ('indicator.ema-trend-reverse',    'false',  'EMAフィルター反転（true=逆張り）')
+  ON CONFLICT (key) DO NOTHING;
+INSERT INTO trading_config (key, value, description) VALUES
+  ('indicator.rci-entry-min',        '-60.0',  'RCI新規建てフィルター下限')
+  ON CONFLICT (key) DO NOTHING;
+INSERT INTO trading_config (key, value, description) VALUES
+  ('indicator.rci-entry-max',        '60.0',   'RCI新規建てフィルター上限')
+  ON CONFLICT (key) DO NOTHING;
+INSERT INTO trading_config (key, value, description) VALUES
+  ('trade.daily-profit-limit',       '0',      '1日の損益上限（円）。0=制限なし')
+  ON CONFLICT (key) DO NOTHING;
+INSERT INTO trading_config (key, value, description) VALUES
+  ('trade.daily-loss-limit',         '0',      '1日の損益下限（円）。0=制限なし')
+  ON CONFLICT (key) DO NOTHING;
